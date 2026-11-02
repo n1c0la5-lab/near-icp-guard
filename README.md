@@ -19,8 +19,14 @@ Built at NEAR HACKATHON (Nov 2026).
 3. To pay, the canister builds the NEAR transaction itself (Borsh), signs
    `sha256(tx)` with `sign_with_schnorr`, **verifies the signature locally**, and
    returns the signed transaction.
-4. `scripts/spike.mjs` fetches nonce and block hash from NEAR RPC, checks the
-   canister's bytes against NEAR's own library, and submits the transaction.
+4. `scripts/spike.mjs` (running as the agent) fetches nonce and block hash
+   from NEAR RPC and asks the canister to sign. Before it submits, it checks
+   the **signed transaction from the update response**: the unsigned part must
+   equal what NEAR's own library (`@near-js/transactions`) builds, byte for
+   byte, and the ed25519 signature must verify against the canister's key over
+   `sha256(unsigned)` (`scripts/verify-signed.mjs`). The earlier
+   `preview_transfer` comparison is a query, answered by a single replica, so
+   it is only a hint.
 
 Nonce and block hash come from the caller and are **untrusted by design**: a
 wrong value only makes NEAR reject the transaction. It never changes what gets
@@ -37,8 +43,11 @@ paid to whom.
 | anyone else | — | `account`, `preview_transfer` (signs nothing) | sign, set, read config or log |
 
 `init` refuses the anonymous principal as owner: the install traps and nothing
-is installed. The agent can never be the owner or the anonymous principal.
-`set_agent(null)` removes the agent; from then on nothing is signed.
+is installed. Every protected method (`sign_transfer`, `set_agent`,
+`set_policy`, `get_config`, `audit_log`) refuses an anonymous caller
+explicitly. The agent can never be the owner or the anonymous principal.
+The owner can replace the agent (`set_agent(opt <new>)`) or remove it
+(`set_agent(null)`); the old agent cannot sign from that moment on.
 
 **Rules**, checked before every signature, in this order:
 
@@ -63,17 +72,22 @@ the meantime sees the reservation. If signing fails, the reservation is
 released. Tested natively and live (see below: two parallel requests, exactly
 one signed).
 
-**Audit log.** Every `sign_transfer` call, also rejected ones and ones from
-callers who are not the agent, is logged with time, caller, receiver, amount
-(as requested, clipped to 64 characters) and outcome: `Signed` with the
-transaction hash, or `Rejected` with the reason. `Pending` marks a request
-whose signature has not come back yet. The log is a ring buffer of the last
-1000 entries; `seq` keeps counting, so a gap at the start shows evicted
-entries. Owner and agent read it with `audit_log` (a query call, answered by
-one replica and not certified).
+**Audit log.** Every `sign_transfer` call from the owner or the agent, signed
+or rejected, is logged with time, caller, receiver, amount (as requested,
+clipped to 64 characters) and outcome: `Signed` with the transaction hash, or
+`Rejected` with the reason. `Pending` marks a request whose signature has not
+come back yet. The log is a ring buffer of the last 1000 entries; `seq` keeps
+counting, so a gap at the start shows evicted entries. Calls from anyone else
+are **counted, not logged** (`rejected_unauthorized` in `get_config`), so a
+stranger cannot push the real entries out of the ring buffer. Owner and agent
+read the log with `audit_log` (a query call, answered by one replica and not
+certified).
 
-**Upgrades** keep owner, agent, policy, today's spent amount and the audit log
-(stable memory). Upgrading the spike version to this one is refused
+**Upgrades** keep owner, agent, policy, today's spent amount, the counter and
+the audit log: `pre_upgrade` writes them to stable memory as one candid value
+(`stable_save`). That value is bounded: a test fills the log and the
+allowlist with maximum-size entries and measures 498,289 bytes
+(`policy::tests::worst_case_state_size`). Upgrading the spike version to this one is refused
 (`post_upgrade` traps and the upgrade rolls back, measured locally): reinstall
 instead. The NEAR account stays the same either way, because the key depends
 on the canister id, not on its state.
@@ -117,11 +131,15 @@ node spike.mjs send --identity <agent identity> <receiver>.testnet 0.1
 node spike.mjs config --identity <agent identity>   # policy and today's spent amount
 ```
 
-`scripts/e2e-policy.sh` reinstalls `guard` on the local network (state wiped,
-same NEAR account), creates the identities `e2e-agent` and `e2e-stranger` if
-missing (plaintext storage, local only), and checks roles, the three rules,
-two parallel requests, the audit log and an upgrade. Its signed transactions
-use a fake block hash (32 zero bytes), so no NEAR network would accept them.
+`scripts/e2e-policy.sh` (needs `npm ci --ignore-scripts` in `scripts/` once)
+reinstalls `guard` on the local network (state wiped, same NEAR account),
+creates the identities `e2e-agent` and `e2e-stranger` if missing (plaintext
+storage, local only), and checks roles, anonymous on every protected method,
+the three rules, two parallel requests, the audit log and its counter, an
+upgrade, the check of the signed transaction (`scripts/check-signed.mjs`:
+the real response passes, six tampered or different ones are refused), and
+replacing and removing the agent. Its signed transactions use a fake block
+hash (32 zero bytes), so no NEAR network would accept them.
 
 The local network listens on **port 8010** (set in `icp.yaml`); 8000 is a
 common default and was taken on our dev machine. Change it there if 8010 is
@@ -167,27 +185,31 @@ Regenerate vectors only with `npm run vectors`, never by hand.
 
 The policy is pure code (`canister/src/policy.rs`: no IC calls, time passed in),
 so every rule is tested natively. Sabotage probes for the policy, each run on a
-copy with one rule broken (`cargo test --no-fail-fast`, 29 tests):
+copy with one rule broken (`cargo test --no-fail-fast`, 33 tests):
 
 | Deliberate bug | Caught |
 |---|---|
 | per-transaction limit check removed | 2 tests red |
 | daily limit check removed | 3 tests red |
-| allowlist check removed | 2 tests red |
+| allowlist check removed | 4 tests red |
 | reservation moved after the await (check before, reserve after) | 2 tests red |
 | failed signature keeps its reservation | 1 test red |
 | daily total never resets at the UTC day change | 2 tests red |
 | release ignores the day of the reservation | 1 test red |
 | `checked_add` replaced by `wrapping_add` | 1 test red |
 | anonymous owner accepted | 1 test red |
-| `set_policy` without owner check (agent changes policy) | 1 test red |
-| `set_agent` without owner check | 1 test red |
+| explicit anonymous check removed | 2 tests red |
+| `set_policy` without owner check (agent changes policy) | 2 tests red |
+| `set_agent` without owner check | 2 tests red |
 | agent may be the owner | 1 test red |
-| owner may sign | 1 test red |
-| agent check removed (stranger / anonymous may sign) | 3 tests red |
+| owner may sign | 2 tests red |
+| anyone may sign (stranger branch and agent check removed) | 4 tests red |
+| `set_agent` cannot replace an existing agent | 1 test red |
+| `set_agent(null)` ignored | 2 tests red |
 | rejected requests not logged | 3 tests red |
+| strangers written into the log again | 2 tests red |
 | anyone may read config and log | 1 test red |
-| audit log unbounded | 2 tests red |
+| audit log unbounded | 3 tests red |
 | `guard.did` out of sync (`audit_log` removed) | 1 test red |
 
 And two probes against the deployed canister on the local network, with
@@ -197,6 +219,14 @@ And two probes against the deployed canister on the local network, with
 |---|---|
 | reservation moved after the await | 3 checks red: both parallel requests signed |
 | `pre_upgrade` saves a fresh state | 5 checks red: config, log and budget lost |
+
+And two probes against the check of the signed transaction
+(`scripts/check-signed.mjs`, run against the local canister):
+
+| Deliberate bug | Caught |
+|---|---|
+| ed25519 verification skipped | 1 check red: flipped signature byte accepted |
+| byte comparison with near-js skipped | 1 check red: validly signed 2-yocto tx accepted for a 1-yocto request |
 
 ## Proven so far (spike gate)
 
@@ -212,10 +242,11 @@ And two probes against the deployed canister on the local network, with
 - `test_key_1` exists on the local network; `account` returns the same NEAR
   account before and after a reinstall.
 - `spike.mjs` parses the `icp` output (`account`, `send`).
-- **Policy on the local network.** `scripts/e2e-policy.sh` passes all 32 checks:
-  default deny, roles, the three rules, two parallel requests of which exactly
-  one is signed, the audit log, and an upgrade that keeps owner, agent,
-  policy, spent amount, log and NEAR account. (The testnet transfer above was
+- **Policy on the local network.** `scripts/e2e-policy.sh` passes all 45 checks:
+  default deny, roles, anonymous refused on every protected method, the three
+  rules, two parallel requests of which exactly one is signed, the audit log,
+  an upgrade that keeps owner, agent, policy, spent amount, log and NEAR
+  account, the signed-transaction check, and agent replacement and removal. (The testnet transfer above was
   signed by the spike, before the policy existed.)
 
 ## Known unknowns (check before trusting)
@@ -227,9 +258,13 @@ And two probes against the deployed canister on the local network, with
 - **Policy with real NEAR.** The policy has run against the local network
   with fake block hashes; a policy-checked transfer has not yet been
   submitted to NEAR testnet.
-- **Audit log flooding.** Any caller can add rejected entries to the log and
-  so push older entries out of the ring buffer; `seq` shows that it happened,
-  but the evicted entries are gone.
+- **Audit log flooding by the agent.** Strangers are only counted, but the
+  agent itself (for example a compromised one) can still fill the ring buffer
+  with rejected requests and push older entries out; `seq` shows that it
+  happened, the evicted entries are gone.
+- **`spike.mjs` wiring.** `check-signed.mjs` tests the check function against
+  the real canister; that `spike.mjs send` calls it before `send_tx` was seen
+  against a local stand-in RPC, not against NEAR testnet yet.
 - **ICP mainnet.** Nothing here has run on ICP mainnet.
 
 ## License
