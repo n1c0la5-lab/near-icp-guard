@@ -9,6 +9,7 @@ type Config = record {
   policy : Policy;
   utc_day : nat64;
   spent_today_yocto : text;
+  rejected_unauthorized : nat64;
 };
 type Outcome = variant {
   Pending;

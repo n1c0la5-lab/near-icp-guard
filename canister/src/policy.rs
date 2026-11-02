@@ -20,6 +20,14 @@
 //!
 //! Rules, checked before every signature (safe default: everything denied):
 //! 1. per-transaction limit, 2. daily limit per UTC day, 3. receiver allowlist.
+//!
+//! Every protected method refuses the anonymous principal first, explicitly,
+//! even where the role check would refuse it anyway.
+//!
+//! Audit log: sign requests from the owner and the agent are logged with their
+//! outcome. Requests from anyone else are only counted
+//! (`rejected_unauthorized`): if they were logged, any stranger could push the
+//! real entries out of the bounded log.
 
 use crate::near_tx::validate_account_id;
 use candid::{CandidType, Deserialize, Principal};
@@ -49,6 +57,7 @@ pub fn parse_yocto(s: &str) -> Result<u128, Refusal> {
 /// Why a call was refused. `Display` is the text callers and the log see.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Refusal {
+    AnonymousCaller,
     AnonymousOwner,
     NotOwner,
     NotOwnerOrAgent,
@@ -71,6 +80,7 @@ impl fmt::Display for Refusal {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         use Refusal::*;
         match self {
+            AnonymousCaller => write!(f, "rejected: anonymous caller"),
             AnonymousOwner => write!(f, "the anonymous principal cannot be the owner; install with your own identity"),
             NotOwner => write!(f, "only the owner may do this"),
             NotOwnerOrAgent => write!(f, "only the owner or the agent may read this"),
@@ -218,6 +228,9 @@ pub struct Config {
     pub policy: Policy,
     pub utc_day: u64,
     pub spent_today_yocto: String,
+    /// Sign requests from callers that are neither owner nor agent. Counted,
+    /// not logged.
+    pub rejected_unauthorized: u64,
 }
 
 /// Proof that a request passed every rule and holds a reservation. Not
@@ -255,6 +268,7 @@ pub struct Guard {
     spend: DailySpend,
     log: Vec<AuditEntry>,
     next_seq: u64,
+    rejected_unauthorized: u64,
 }
 
 impl Guard {
@@ -270,17 +284,31 @@ impl Guard {
             spend: DailySpend::default(),
             log: Vec::new(),
             next_seq: 0,
+            rejected_unauthorized: 0,
         })
     }
 
+    fn reject_anonymous(caller: Principal) -> Result<(), Refusal> {
+        if caller == Principal::anonymous() {
+            return Err(Refusal::AnonymousCaller);
+        }
+        Ok(())
+    }
+
     fn require_owner(&self, caller: Principal) -> Result<(), Refusal> {
+        Self::reject_anonymous(caller)?;
         if caller != self.owner {
             return Err(Refusal::NotOwner);
         }
         Ok(())
     }
 
+    fn is_owner_or_agent(&self, caller: Principal) -> bool {
+        caller == self.owner || Some(caller) == self.agent
+    }
+
     fn require_reader(&self, caller: Principal) -> Result<(), Refusal> {
+        Self::reject_anonymous(caller)?;
         if caller == self.owner || Some(caller) == self.agent {
             Ok(())
         } else {
@@ -319,6 +347,7 @@ impl Guard {
             policy: self.rules.to_policy(),
             utc_day: day,
             spent_today_yocto: self.spend.spent_on(day).to_string(),
+            rejected_unauthorized: self.rejected_unauthorized,
         })
     }
 
@@ -328,6 +357,7 @@ impl Guard {
     }
 
     fn authorize_sign(&self, caller: Principal) -> Result<(), Refusal> {
+        Self::reject_anonymous(caller)?;
         if caller == self.owner {
             return Err(Refusal::OwnerCannotSign);
         }
@@ -369,9 +399,15 @@ impl Guard {
         seq
     }
 
-    /// Step 1 of a signature, synchronous, before the canister awaits. Every
-    /// call is logged: refused ones as `Rejected`, admitted ones as `Pending`.
+    /// Step 1 of a signature, synchronous, before the canister awaits. Calls
+    /// from owner or agent are logged (refused ones as `Rejected`, admitted
+    /// ones as `Pending`); calls from anyone else are only counted.
     pub fn begin_sign(&mut self, caller: Principal, receiver_id: &str, yocto: &str, now_ns: u64) -> Result<Ticket, Refusal> {
+        if !self.is_owner_or_agent(caller) {
+            self.rejected_unauthorized = self.rejected_unauthorized.saturating_add(1);
+            // Never `Ok` for such a caller; `NotAgent` only as a fallback.
+            return Err(self.authorize_sign(caller).err().unwrap_or(Refusal::NotAgent));
+        }
         let admitted = self.admit(caller, receiver_id, yocto, now_ns);
         let logged_receiver = clip(receiver_id, MAX_LOGGED_INPUT);
         let logged_yocto = clip(yocto, MAX_LOGGED_INPUT);
@@ -519,10 +555,32 @@ mod tests {
     #[test]
     fn only_the_agent_can_sign() {
         let mut g = configured();
-        for caller in [stranger(), Principal::anonymous()] {
-            assert_eq!(ask(&mut g, caller, "alice.testnet", 1, NOW).unwrap_err(), Refusal::NotAgent);
-        }
+        assert_eq!(ask(&mut g, stranger(), "alice.testnet", 1, NOW).unwrap_err(), Refusal::NotAgent);
+        assert_eq!(ask(&mut g, Principal::anonymous(), "alice.testnet", 1, NOW).unwrap_err(), Refusal::AnonymousCaller);
+        assert_eq!(spent(&g, NOW), 0);
         assert!(ask(&mut g, agent(), "alice.testnet", 1, NOW).is_ok());
+    }
+
+    /// Every protected method refuses anonymous explicitly — also where the
+    /// role check alone would refuse it.
+    #[test]
+    fn anonymous_is_refused_everywhere() {
+        let mut g = configured();
+        let anon = Principal::anonymous();
+        assert_eq!(ask(&mut g, anon, "alice.testnet", 1, NOW).unwrap_err(), Refusal::AnonymousCaller);
+        assert_eq!(g.set_policy(anon, &policy(1, 1, &[])), Err(Refusal::AnonymousCaller));
+        assert_eq!(g.set_agent(anon, None), Err(Refusal::AnonymousCaller));
+        assert_eq!(g.config(anon, NOW).unwrap_err(), Refusal::AnonymousCaller);
+        assert_eq!(g.audit_log(anon).unwrap_err(), Refusal::AnonymousCaller);
+    }
+
+    #[test]
+    fn replaced_agent_cannot_sign() {
+        let mut g = configured();
+        let new_agent = p(4);
+        g.set_agent(owner(), Some(new_agent)).unwrap();
+        assert_eq!(ask(&mut g, agent(), "alice.testnet", 1, NOW).unwrap_err(), Refusal::NotAgent);
+        assert!(ask(&mut g, new_agent, "alice.testnet", 1, NOW).is_ok());
     }
 
     #[test]
@@ -539,10 +597,10 @@ mod tests {
         assert!(g.config(agent(), NOW).is_ok());
         assert!(g.audit_log(owner()).is_ok());
         assert!(g.audit_log(agent()).is_ok());
-        for caller in [stranger(), Principal::anonymous()] {
-            assert_eq!(g.config(caller, NOW).unwrap_err(), Refusal::NotOwnerOrAgent);
-            assert_eq!(g.audit_log(caller).unwrap_err(), Refusal::NotOwnerOrAgent);
-        }
+        assert_eq!(g.config(stranger(), NOW).unwrap_err(), Refusal::NotOwnerOrAgent);
+        assert_eq!(g.audit_log(stranger()).unwrap_err(), Refusal::NotOwnerOrAgent);
+        assert!(g.config(Principal::anonymous(), NOW).is_err());
+        assert!(g.audit_log(Principal::anonymous()).is_err());
     }
 
     // ---- safe default --------------------------------------------------------
@@ -685,7 +743,7 @@ mod tests {
     #[test]
     fn every_request_is_logged_with_its_outcome() {
         let mut g = configured();
-        let _ = ask(&mut g, stranger(), "alice.testnet", 1, NOW);
+        let _ = ask(&mut g, owner(), "alice.testnet", 1, NOW);
         let _ = ask(&mut g, agent(), "attacker.testnet", 7, NOW + 1);
         let t = ask(&mut g, agent(), "alice.testnet", 5, NOW + 2).unwrap();
         assert_eq!(g.log[2].outcome, Outcome::Pending);
@@ -696,7 +754,7 @@ mod tests {
         let log = g.audit_log(owner()).unwrap();
         assert_eq!(log.len(), 4);
         assert_eq!(log.iter().map(|e| e.seq).collect::<Vec<_>>(), [0, 1, 2, 3]);
-        assert_eq!((log[0].caller, log[0].outcome.clone()), (stranger(), Outcome::Rejected { reason: Refusal::NotAgent.to_string() }));
+        assert_eq!((log[0].caller, log[0].outcome.clone()), (owner(), Outcome::Rejected { reason: Refusal::OwnerCannotSign.to_string() }));
         assert_eq!((log[1].receiver_id.as_str(), log[1].yocto.as_str(), log[1].time_ns), ("attacker.testnet", "7", NOW + 1));
         assert!(matches!(&log[1].outcome, Outcome::Rejected { reason } if reason.contains("allowlist")));
         assert_eq!(log[2].outcome, Outcome::Signed { tx_hash: "HASH".into() });
@@ -708,7 +766,7 @@ mod tests {
         let mut g = configured();
         let long = "x".repeat(10_000);
         for i in 0..AUDIT_LOG_CAPACITY + 5 {
-            let _ = g.begin_sign(stranger(), &long, &long, NOW + i as u64);
+            let _ = g.begin_sign(agent(), &long, &long, NOW + i as u64);
         }
         let log = g.audit_log(owner()).unwrap();
         assert_eq!(log.len(), AUDIT_LOG_CAPACITY);
@@ -723,25 +781,67 @@ mod tests {
         let mut g = configured();
         let t = ask(&mut g, agent(), "alice.testnet", 9, NOW).unwrap();
         for _ in 0..AUDIT_LOG_CAPACITY {
-            let _ = ask(&mut g, stranger(), "alice.testnet", 1, NOW);
+            let _ = ask(&mut g, agent(), "attacker.testnet", 1, NOW);
         }
         g.finish_sign(t, Ok("LATE".into()));
         let last = g.log.last().unwrap();
         assert_eq!((last.yocto.as_str(), last.outcome.clone()), ("9", Outcome::Signed { tx_hash: "LATE".into() }));
     }
 
+    /// Strangers must not be able to push the real entries out of the log.
+    #[test]
+    fn strangers_are_counted_not_logged() {
+        let mut g = configured();
+        sign(&mut g, "alice.testnet", 1, NOW).unwrap();
+        let _ = ask(&mut g, agent(), "attacker.testnet", 1, NOW);
+        let before = g.audit_log(owner()).unwrap();
+        for i in 0..5 * AUDIT_LOG_CAPACITY {
+            let caller = if i % 2 == 0 { stranger() } else { Principal::anonymous() };
+            assert!(ask(&mut g, caller, "alice.testnet", 1, NOW).is_err());
+        }
+        assert_eq!(g.audit_log(owner()).unwrap(), before, "strangers changed the log");
+        assert_eq!(g.config(owner(), NOW).unwrap().rejected_unauthorized, 5 * AUDIT_LOG_CAPACITY as u64);
+        assert_eq!(spent(&g, NOW), 1);
+    }
+
     // ---- upgrade -------------------------------------------------------------
+
+    /// Worst case for `pre_upgrade`: a full log of entries with every
+    /// caller-supplied field at its clipped maximum (2-byte characters),
+    /// plus a full allowlist. Prints the encoded size; must stay well below
+    /// what an upgrade can serialize.
+    #[test]
+    fn worst_case_state_size() {
+        let mut g = configured();
+        let ids: Vec<String> = (0..MAX_ALLOWLIST_LEN).map(|i| format!("{i:0>2}{}", "a".repeat(62))).collect();
+        let refs: Vec<&str> = ids.iter().map(String::as_str).collect();
+        g.set_policy(owner(), &policy(u128::MAX, u128::MAX, &refs)).unwrap();
+        let wide = "é".repeat(10_000);
+        for _ in 0..AUDIT_LOG_CAPACITY {
+            let t = ask(&mut g, agent(), &ids[0], 1, NOW).unwrap();
+            g.finish_sign(t, Err(wide.clone()));
+        }
+        for _ in 0..AUDIT_LOG_CAPACITY / 2 {
+            let _ = g.begin_sign(agent(), &wide, &wide, NOW);
+        }
+        assert_eq!(g.log.len(), AUDIT_LOG_CAPACITY);
+        let bytes = candid::encode_one(&g).unwrap().len();
+        println!("worst-case stable state: {bytes} bytes for {AUDIT_LOG_CAPACITY} log entries");
+        assert!(bytes < 1 << 20, "state grew to {bytes} bytes");
+    }
 
     /// What `pre_upgrade` writes, `post_upgrade` must read back unchanged.
     #[test]
     fn state_round_trips_through_candid() {
         let mut g = configured();
         sign(&mut g, "alice.testnet", NEAR / 4, NOW).unwrap();
+        let _ = ask(&mut g, agent(), "attacker.testnet", 1, NOW);
         let _ = ask(&mut g, stranger(), "alice.testnet", 1, NOW);
         let bytes = candid::encode_one(&g).unwrap();
         let back: Guard = candid::decode_one(&bytes).unwrap();
         assert_eq!(back, g);
         assert_eq!(spent(&back, NOW), NEAR / 4);
         assert_eq!(back.log.len(), 2);
+        assert_eq!(back.rejected_unauthorized, 1);
     }
 }
