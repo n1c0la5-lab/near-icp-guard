@@ -1,0 +1,4 @@
+target/
+node_modules/
+.icp/cache/
+# .icp/data/ holds canister id mappings and belongs in git

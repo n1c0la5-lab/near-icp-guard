@@ -1,0 +1,9 @@
+# icp-cli project file (icp >= 1.2). Recipe version is pinned on purpose:
+# icp rejects unpinned recipes.
+canisters:
+  - name: guard
+    recipe:
+      type: "@dfinity/rust@v3.3.0"
+      configuration:
+        package: guard
+        candid: canister/guard.did

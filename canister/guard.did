@@ -1,0 +1,9 @@
+type InitArgs = record { key_name : opt text };
+type Account = record { public_key_hex : text; public_key_near : text; account_id : text };
+type TransferRequest = record { receiver_id : text; yocto : text; nonce : nat64; block_hash : text };
+type SignedTransfer = record { signed_tx_base64 : text; tx_hash : text };
+service : (opt InitArgs) -> {
+  account : () -> (variant { Ok : Account; Err : text });
+  preview_transfer : (TransferRequest) -> (variant { Ok : text; Err : text }) query;
+  sign_transfer : (TransferRequest) -> (variant { Ok : SignedTransfer; Err : text });
+}
