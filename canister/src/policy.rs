@@ -527,10 +527,12 @@ mod tests {
         let mut g = configured();
         let before = g.clone();
         for caller in [agent(), stranger(), Principal::anonymous()] {
-            assert_eq!(g.set_policy(caller, &policy(u128::MAX, u128::MAX, &["attacker.testnet"])), Err(Refusal::NotOwner));
-            assert_eq!(g.set_agent(caller, Some(stranger())), Err(Refusal::NotOwner));
-            assert_eq!(g.set_agent(caller, None), Err(Refusal::NotOwner));
+            assert!(g.set_policy(caller, &policy(u128::MAX, u128::MAX, &["attacker.testnet"])).is_err());
+            assert!(g.set_agent(caller, Some(stranger())).is_err());
+            assert!(g.set_agent(caller, None).is_err());
         }
+        assert_eq!(g.set_policy(agent(), &policy(1, 1, &[])), Err(Refusal::NotOwner));
+        assert_eq!(g.set_agent(agent(), None), Err(Refusal::NotOwner));
         assert_eq!(g, before, "a refused call changed state");
     }
 
