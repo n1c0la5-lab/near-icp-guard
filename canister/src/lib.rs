@@ -1,24 +1,26 @@
-//! Spike: an ICP canister that owns a NEAR account through a threshold
-//! Ed25519 key and signs NEAR transfers. No single machine ever holds the key.
+//! An ICP canister that owns a NEAR account through a threshold Ed25519 key
+//! and signs NEAR transfers for an AI agent, but only within the owner's
+//! policy. No single machine ever holds the key.
 //!
 //! The NEAR account is the *implicit* account of the canister's public key
 //! (`hex(public_key)`): funding it creates it, with that key as its only
 //! full-access key.
 //!
-//! Spike scope: only the owner (the identity that installed the canister) may
-//! request signatures. The policy engine comes after this proves the path works.
+//! Roles and rules live in [`policy`] as pure code; this file is the IC glue.
 
 pub mod near_tx;
+pub mod policy;
 
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use candid::{CandidType, Deserialize, Principal};
 use ed25519_dalek::{Signature, VerifyingKey};
-use ic_cdk::api::msg_caller;
+use ic_cdk::api::{msg_caller, time};
 use ic_cdk_management_canister::{
     schnorr_public_key, sign_with_schnorr, SchnorrAlgorithm, SchnorrKeyId, SchnorrPublicKeyArgs,
     SignWithSchnorrArgs,
 };
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use near_tx::{decode_block_hash, implicit_account_id, validate_account_id, Transfer};
+use policy::{parse_yocto, AuditEntry, Config, Guard, Policy};
 use std::cell::RefCell;
 
 /// Every key this canister derives lives under this path. Changing it changes
@@ -61,9 +63,17 @@ pub struct SignedTransfer {
 }
 
 struct State {
-    owner: Principal,
+    guard: Guard,
     key_name: String,
     public_key: Option<[u8; 32]>,
+}
+
+/// What survives an upgrade. The public key is not stored: it is cheap to
+/// fetch again and derives the same NEAR account.
+#[derive(CandidType, Deserialize)]
+struct StableState {
+    guard: Guard,
+    key_name: String,
 }
 
 thread_local! {
@@ -89,36 +99,43 @@ fn account_of(pk: &[u8; 32]) -> Account {
     }
 }
 
+/// The installer becomes the owner. An anonymous installer is refused: the
+/// install traps and nothing is installed.
 #[ic_cdk::init]
 fn init(args: Option<InitArgs>) {
+    let guard = Guard::new(msg_caller()).unwrap_or_else(|e| ic_cdk::trap(e.to_string()));
     let key_name = args
         .and_then(|a| a.key_name)
         .unwrap_or_else(|| DEFAULT_KEY_NAME.to_string());
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
-            owner: msg_caller(),
+            guard,
             key_name,
             public_key: None,
         })
     });
 }
 
-// Owner and key name survive upgrades; the public key is cheap to fetch again
-// and derives the same NEAR account.
+// Owner, agent, policy, today's spent total and the audit log survive upgrades.
 #[ic_cdk::pre_upgrade]
 fn pre_upgrade() {
-    let (owner, key_name) = with_state(|s| (s.owner, s.key_name.clone()));
-    ic_cdk::storage::stable_save((owner, key_name)).expect("saving state failed");
+    let stable = with_state(|s| StableState {
+        guard: s.guard.clone(),
+        key_name: s.key_name.clone(),
+    });
+    ic_cdk::storage::stable_save((stable,)).expect("saving state failed");
 }
 
+/// A layout this code does not know (e.g. the spike's) traps, which rolls the
+/// upgrade back; reinstall instead.
 #[ic_cdk::post_upgrade]
 fn post_upgrade() {
-    let (owner, key_name): (Principal, String) =
-        ic_cdk::storage::stable_restore().expect("restoring state failed");
+    let (stable,): (StableState,) = ic_cdk::storage::stable_restore()
+        .unwrap_or_else(|e| ic_cdk::trap(format!("restoring state failed: {e}")));
     STATE.with(|s| {
         *s.borrow_mut() = Some(State {
-            owner,
-            key_name,
+            guard: stable.guard,
+            key_name: stable.key_name,
             public_key: None,
         })
     });
@@ -146,10 +163,9 @@ async fn account() -> Result<Account, String> {
     Ok(account_of(&pk))
 }
 
-fn build(req: &TransferRequest) -> Result<Transfer, String> {
+fn build(req: &TransferRequest, yocto: u128) -> Result<Transfer, String> {
     let pk = with_state(|s| s.public_key).ok_or("call `account` once first")?;
     validate_account_id(&req.receiver_id).map_err(|e| format!("receiver_id invalid: {e:?}"))?;
-    let yocto: u128 = req.yocto.parse().map_err(|_| "yocto must be a decimal u128")?;
     let block_hash = decode_block_hash(&req.block_hash)?;
     Ok(Transfer {
         signer_id: implicit_account_id(&pk),
@@ -163,17 +179,16 @@ fn build(req: &TransferRequest) -> Result<Transfer, String> {
 
 /// The exact unsigned bytes `sign_transfer` would sign, as hex. Lets the script
 /// compare them with what `@near-js/transactions` builds for the same input.
+/// Signs nothing and checks no policy.
 #[ic_cdk::query]
 fn preview_transfer(req: TransferRequest) -> Result<String, String> {
-    Ok(hex::encode(build(&req)?.encode()))
+    let yocto = parse_yocto(&req.yocto).map_err(|e| e.to_string())?;
+    Ok(hex::encode(build(&req, yocto)?.encode()))
 }
 
-#[ic_cdk::update]
-async fn sign_transfer(req: TransferRequest) -> Result<SignedTransfer, String> {
-    if msg_caller() != with_state(|s| s.owner) {
-        return Err("only the owner may request signatures (spike)".into());
-    }
-    let tx = build(&req)?;
+/// Builds, signs and verifies. Only called after the policy admitted the request.
+async fn sign(req: &TransferRequest, yocto: u128) -> Result<SignedTransfer, String> {
+    let tx = build(req, yocto)?;
     let hash = tx.signing_hash();
 
     let res = sign_with_schnorr(&SignWithSchnorrArgs {
@@ -200,6 +215,49 @@ async fn sign_transfer(req: TransferRequest) -> Result<SignedTransfer, String> {
         signed_tx_base64: BASE64.encode(tx.encode_signed(&sig)),
         tx_hash: bs58::encode(hash).into_string(),
     })
+}
+
+/// Agent only. Checked against the policy before anything is signed.
+#[ic_cdk::update]
+async fn sign_transfer(req: TransferRequest) -> Result<SignedTransfer, String> {
+    let caller = msg_caller();
+    let now = time();
+    // Check every rule and reserve the amount in one synchronous step, before
+    // the await below: requests that run during that await see the reservation.
+    let ticket = with_state(|s| s.guard.begin_sign(caller, &req.receiver_id, &req.yocto, now))
+        .map_err(|r| r.to_string())?;
+    let result = sign(&req, ticket.amount()).await;
+    // Keeps the reservation on success, releases it on failure, logs the outcome.
+    let logged = match &result {
+        Ok(s) => Ok(s.tx_hash.clone()),
+        Err(e) => Err(e.clone()),
+    };
+    with_state(|s| s.guard.finish_sign(ticket, logged));
+    result
+}
+
+/// Owner only. `null` removes the agent.
+#[ic_cdk::update]
+fn set_agent(agent: Option<Principal>) -> Result<(), String> {
+    with_state(|s| s.guard.set_agent(msg_caller(), agent)).map_err(|e| e.to_string())
+}
+
+/// Owner only. Replaces all three rules at once.
+#[ic_cdk::update]
+fn set_policy(policy: Policy) -> Result<(), String> {
+    with_state(|s| s.guard.set_policy(msg_caller(), &policy)).map_err(|e| e.to_string())
+}
+
+/// Owner or agent.
+#[ic_cdk::query]
+fn get_config() -> Result<Config, String> {
+    with_state(|s| s.guard.config(msg_caller(), time())).map_err(|e| e.to_string())
+}
+
+/// Owner or agent. Oldest first, at most `policy::AUDIT_LOG_CAPACITY` entries.
+#[ic_cdk::query]
+fn audit_log() -> Result<Vec<AuditEntry>, String> {
+    with_state(|s| s.guard.audit_log(msg_caller())).map_err(|e| e.to_string())
 }
 
 ic_cdk::export_candid!();

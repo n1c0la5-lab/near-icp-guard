@@ -2,8 +2,33 @@ type InitArgs = record { key_name : opt text };
 type Account = record { public_key_hex : text; public_key_near : text; account_id : text };
 type TransferRequest = record { receiver_id : text; yocto : text; nonce : nat64; block_hash : text };
 type SignedTransfer = record { signed_tx_base64 : text; tx_hash : text };
+type Policy = record { per_tx_limit_yocto : text; daily_limit_yocto : text; allowlist : vec text };
+type Config = record {
+  owner : principal;
+  agent : opt principal;
+  policy : Policy;
+  utc_day : nat64;
+  spent_today_yocto : text;
+};
+type Outcome = variant {
+  Pending;
+  Signed : record { tx_hash : text };
+  Rejected : record { reason : text };
+};
+type AuditEntry = record {
+  seq : nat64;
+  time_ns : nat64;
+  caller : principal;
+  receiver_id : text;
+  yocto : text;
+  outcome : Outcome;
+};
 service : (opt InitArgs) -> {
   account : () -> (variant { Ok : Account; Err : text });
   preview_transfer : (TransferRequest) -> (variant { Ok : text; Err : text }) query;
   sign_transfer : (TransferRequest) -> (variant { Ok : SignedTransfer; Err : text });
+  set_agent : (opt principal) -> (variant { Ok; Err : text });
+  set_policy : (Policy) -> (variant { Ok; Err : text });
+  get_config : () -> (variant { Ok : Config; Err : text }) query;
+  audit_log : () -> (variant { Ok : vec AuditEntry; Err : text }) query;
 }
