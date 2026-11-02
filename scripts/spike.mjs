@@ -74,27 +74,50 @@ async function rpc(method, params) {
   return body.result;
 }
 
+// One `query` call. Returns the parsed JSON-RPC body; anything that is not a
+// JSON-RPC answer (network failure, HTTP error page, rate limit) is a hard error.
+async function query(params) {
+  let res;
+  let text;
+  try {
+    res = await fetch(RPC, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: "spike", method: "query", params }),
+    });
+    text = await res.text();
+  } catch (e) {
+    die(`NEAR RPC ${RPC} unreachable: ${e.cause?.message ?? e.message}`);
+  }
+  let body;
+  try {
+    body = JSON.parse(text);
+  } catch {
+    die(`NEAR RPC ${RPC} returned no JSON (HTTP ${res.status}):\n${text.slice(0, 500)}`);
+  }
+  return body;
+}
+
+// Only these mean "does not exist yet". Every other error is a real error.
+const missing = (body, ...names) => names.includes(body.error?.cause?.name);
+
 async function accessKey(accountId, publicKey) {
-  const res = await fetch(RPC, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0",
-      id: "spike",
-      method: "query",
-      params: { request_type: "view_access_key", finality: "final", account_id: accountId, public_key: publicKey },
-    }),
+  const body = await query({
+    request_type: "view_access_key",
+    finality: "final",
+    account_id: accountId,
+    public_key: publicKey,
   });
-  const body = await res.json();
-  const err = body.error?.cause?.name ?? body.result?.error;
-  if (err) {
+  if (missing(body, "UNKNOWN_ACCOUNT", "UNKNOWN_ACCESS_KEY")) {
     die(
-      `account ${accountId} has no access key yet (${typeof err === "string" ? err : JSON.stringify(err)}).\n` +
+      `account ${accountId} has no access key yet (${body.error.cause.name}).\n` +
         `  Fund it first — a transfer to an implicit account creates it.\n` +
         `  Run: node spike.mjs account`,
     );
   }
-  if (body.error) die(`view_access_key: ${JSON.stringify(body.error)}`);
+  if (body.error || body.result?.error) {
+    die(`view_access_key: ${JSON.stringify(body.error ?? body.result.error)}`);
+  }
   return body.result; // { nonce, block_hash, permission, ... }
 }
 
@@ -104,20 +127,14 @@ async function cmdAccount() {
   const { accountId, publicKey } = account();
   console.log(`NEAR account (implicit): ${accountId}`);
   console.log(`public key:              ${publicKey}`);
-  const res = await fetch(RPC, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      jsonrpc: "2.0", id: "spike", method: "query",
-      params: { request_type: "view_account", finality: "final", account_id: accountId },
-    }),
-  });
-  const body = await res.json();
+  const body = await query({ request_type: "view_account", finality: "final", account_id: accountId });
   if (body.result?.amount) {
     console.log(`balance:                 ${body.result.amount} yoctoNEAR`);
-  } else {
+  } else if (missing(body, "UNKNOWN_ACCOUNT")) {
     console.log(`\nNot on testnet yet. Send it some testnet NEAR from any testnet wallet,`);
     console.log(`e.g. with near-cli:  near tokens <your-account> send-near ${accountId} '1 NEAR' network-config testnet`);
+  } else {
+    die(`view_account failed (not a funding problem): ${JSON.stringify(body.error ?? body.result)}`);
   }
 }
 

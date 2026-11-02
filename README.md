@@ -27,7 +27,14 @@ paid to whom.
 
 ## Run it
 
-Prerequisites: Rust with `wasm32-unknown-unknown`, Node 22+, `icp` ≥ 1.2.
+Prerequisites: Rust with `wasm32-unknown-unknown`, Node 22+, `icp` ≥ 1.2, and
+`ic-wasm` (the `@dfinity/rust@v3.3.0` recipe aborts without it):
+
+```bash
+cargo install ic-wasm --locked
+```
+
+Measured with ic-wasm 0.11.1, icp 1.8.0, rustc 1.99.0, Node 22.
 
 ```bash
 # tests (native, no network)
@@ -42,6 +49,20 @@ cd scripts && npm ci
 node spike.mjs account                 # prints the canister's NEAR account
 # fund that account with testnet NEAR, then:
 node spike.mjs send <receiver>.testnet 0.1
+```
+
+The local network listens on **port 8010** (set in `icp.yaml`); 8000 is a
+common default and was taken on our dev machine. Change it there if 8010 is
+busy for you.
+
+**Deploy with your own icp identity, not `anonymous`.** Without one, `icp`
+deploys as the anonymous principal, which then becomes the owner, and anyone
+may sign (measured in the spike: an anonymous `sign_transfer` returned `Ok`).
+Known issue, fixed in the policy phase (`init` will reject an anonymous owner).
+
+```bash
+icp identity new my-identity       # any name
+icp identity default my-identity   # select it before `icp deploy`
 ```
 
 `spike.mjs send` refuses to sign if the canister's transaction bytes differ
@@ -69,20 +90,32 @@ Sabotage probes, each caught by the tests:
 Regenerate vectors only with `npm run vectors`, never by hand.
 `npm run vectors:check` fails if the library and the checked-in file disagree.
 
+## Proven so far (spike gate)
+
+- **Signed on ICP, accepted by NEAR testnet.** The canister signed a 0.1 NEAR
+  transfer with its threshold key; NEAR finalized it:
+  [`HUvCWehTDRtJDVqsipXcgsb16kHXaUsbDYbxegNAL1qN`](https://testnet.nearblocks.io/txns/HUvCWehTDRtJDVqsipXcgsb16kHXaUsbDYbxegNAL1qN)
+  (status `SuccessValue`, `FINAL`). Signer is the canister's implicit account
+  `10283143de96cb3c61b3e410ba13589bd7cd7fbdcdd718860673e2833cb22c86`, key
+  `ed25519:265531gAWxPEFvGhDbiNhudp2X7CPmTZgvHAMScGqPbj`, action
+  `Transfer` of 0.1 NEAR. This ran against a local ICP network with the local
+  `test_key_1`, not against mainnet ICP.
+- `icp.yaml` builds and deploys locally (with the two fixes above).
+- `test_key_1` exists on the local network; `account` returns the same NEAR
+  account before and after a reinstall.
+- `spike.mjs` parses the `icp` output (`account`, `send`).
+
 ## Known unknowns (check before trusting)
 
-- **Key name.** Default `test_key_1` (mainnet test key; the icp-cli examples
-  use it locally too). Production is `key_1`. Override at install with
-  `(opt record { key_name = opt "key_1" })`.
-- **`icp.yaml`.** Written from the icp-cli docs, not yet run here. If the
-  recipe complains about paths, `icp project show` shows how it expands.
-- **`icp canister call` output.** `spike.mjs` parses candid text with regexes.
-  If a field is not found, it prints the raw output.
+- **Key name.** Default `test_key_1`. Production is `key_1`, not yet tried.
+  Override at install with `(opt record { key_name = opt "key_1" })`.
 - **Upgrades.** Owner and key name are kept in stable memory across upgrades;
   the public key is fetched again and derives the same NEAR account. Not yet
   exercised on a real upgrade.
 - **Access control.** Only the installing identity may sign. That is the
-  spike's whole policy.
+  spike's whole policy, and it is only as strong as that identity (see the
+  anonymous-owner issue above).
+- **ICP mainnet.** Nothing here has run on ICP mainnet.
 
 ## License
 
