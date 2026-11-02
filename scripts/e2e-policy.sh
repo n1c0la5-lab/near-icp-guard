@@ -126,7 +126,11 @@ grep -q "spent_today_yocto = \"$(yocto 0.5)\"" <<<"$CONFIG_BEFORE" && ok "spent 
 [[ "$N_BEFORE" == 10 ]] && ok "audit log has all 10 sign requests" || bad "audit log has $N_BEFORE entries, want 10" "$LOG_BEFORE"
 
 echo "== upgrade"
+upgrades() { icp canister logs guard 2>/dev/null | grep -c 'post_upgrade: state restored' || true; }
+UPGRADES_BEFORE=$(upgrades)
 icp deploy guard --mode upgrade -y --identity "$OWNER" >/dev/null 2>&1 || { echo "upgrade failed"; icp deploy guard --mode upgrade -y --identity "$OWNER"; exit 1; }
+UPGRADES_AFTER=$(upgrades)
+[[ "$UPGRADES_AFTER" -gt "$UPGRADES_BEFORE" ]] && ok "post_upgrade ran (canister log: $UPGRADES_BEFORE -> $UPGRADES_AFTER)" || bad "no post_upgrade in the canister log" "$(icp canister logs guard 2>&1 | tail -5)"
 CONFIG_AFTER=$(call "$OWNER" get_config '()' | grep -v 'utc_day')
 LOG_AFTER=$(call "$OWNER" audit_log '()')
 ACCOUNT_AFTER=$(call "$OWNER" account '()' | grep -o 'account_id = "[0-9a-f]*"')
@@ -140,10 +144,17 @@ expect_err "agent: 1 more yocto" "exceeds the daily limit" "$AGENT" sign_transfe
 echo "== audit log (owner)"
 call "$OWNER" audit_log '()' | python3 -c '
 import re, sys
-t = sys.stdin.read()
-for e in re.findall(r"record \{(.*?)outcome = variant \{(.*?)\};\s*\}", t, re.S):
-    f = dict(re.findall(r"(\w+) = \"?([^\";]*)\"?;", e[0]))
-    print(f"  #{f.get(\"seq\",\"?\"):>3} {f[\"caller\"][:11]:11} {f[\"receiver_id\"]:17} {f[\"yocto\"]:>26}  {\" \".join(e[1].split())[:110]}")
+def get(pat, t):
+    m = re.search(pat, t)
+    return m.group(1) if m else "?"
+for e in sys.stdin.read().split("record { seq = ")[1:]:
+    seq = e.split(" ", 1)[0]
+    caller = get(r"caller = principal \"([^\"]+)\"", e)[:11]
+    to = get(r"receiver_id = \"([^\"]*)\"", e)
+    yocto = get(r"yocto = \"([^\"]*)\"", e)
+    out = get(r"outcome = variant \{ (\w+)", e)
+    detail = get(r"(?:reason|tx_hash) = \"([^\"]*)\"", e)
+    print("  #%-2s %-11s %-16s %24s  %-8s %s" % (seq, caller, to, yocto, out, detail))
 '
 
 echo

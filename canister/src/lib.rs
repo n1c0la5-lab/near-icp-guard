@@ -139,6 +139,8 @@ fn post_upgrade() {
             public_key: None,
         })
     });
+    // A visible marker that an upgrade really ran (`icp canister logs guard`).
+    ic_cdk::println!("post_upgrade: state restored");
 }
 
 /// Fetches (once) and returns the canister's NEAR account. Update call, because
