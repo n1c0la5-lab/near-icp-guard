@@ -1,11 +1,15 @@
-// End-to-end spike: an ICP canister signs a NEAR testnet transfer.
+// The agent's side: ask the guard canister to sign a NEAR testnet transfer.
 //
-//   node spike.mjs account                      # show the canister's NEAR account
-//   node spike.mjs send <receiver> <amountNEAR> # sign in the canister, send to NEAR
+//   node spike.mjs account                                       # the canister's NEAR account
+//   node spike.mjs config  --identity <owner|agent>              # policy, agent, spent today
+//   node spike.mjs send    --identity <agent> <receiver> <NEAR>  # sign in the canister, send to NEAR
 //
-// Canister calls go through the `icp` CLI, so they run as your selected icp
-// identity (the owner) and no key ever touches this script.
+// Canister calls go through the `icp` CLI, so they run as an icp identity and
+// no key ever touches this script. Only the agent identity the owner set with
+// `set_agent` gets signatures; the canister checks the policy first.
 //
+// Identity: --identity <name> or GUARD_IDENTITY (default: icp's default
+// identity; `send` requires one to be named).
 // Env: GUARD_CANISTER (default "guard"), ICP_ENV (default: icp's default env),
 //      NEAR_RPC (default https://rpc.testnet.near.org)
 
@@ -19,6 +23,15 @@ const CANISTER = process.env.GUARD_CANISTER ?? "guard";
 const RPC = process.env.NEAR_RPC ?? "https://rpc.testnet.near.org";
 const EXPLORER = "https://testnet.nearblocks.io/txns/";
 
+// `--identity <name>` may appear anywhere; everything else is positional.
+const argv = process.argv.slice(2);
+let IDENTITY = process.env.GUARD_IDENTITY;
+const positional = [];
+for (let i = 0; i < argv.length; i++) {
+  if (argv[i] === "--identity") IDENTITY = argv[++i];
+  else positional.push(argv[i]);
+}
+
 function die(msg) {
   console.error(`\n✗ ${msg}`);
   process.exit(1);
@@ -29,12 +42,15 @@ function die(msg) {
 function icpCall(method, arg = "()") {
   const args = ["canister", "call", CANISTER, method, arg];
   if (process.env.ICP_ENV) args.push("-e", process.env.ICP_ENV);
+  if (IDENTITY) args.push("--identity", IDENTITY);
   let out;
   try {
     out = execFileSync("icp", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] });
   } catch (e) {
     die(`icp ${args.join(" ")}\n${e.stderr || e.message}`);
   }
+  const err = out.match(/Err\s*=\s*"([^"]*)"/);
+  if (err) die(`the guard refused ${method}: ${err[1]}`);
   if (/\bErr\b/.test(out)) die(`canister ${method} returned an error:\n${out}`);
   return out;
 }
@@ -138,8 +154,13 @@ async function cmdAccount() {
   }
 }
 
+function cmdConfig() {
+  process.stdout.write(icpCall("get_config"));
+}
+
 async function cmdSend(receiver, amount) {
-  if (!receiver || !amount) die("usage: node spike.mjs send <receiver> <amountNEAR>");
+  if (!receiver || !amount) die("usage: node spike.mjs send --identity <agent> <receiver> <amountNEAR>");
+  if (!IDENTITY) die("send runs as the agent: name it with --identity <agent> or GUARD_IDENTITY");
   // Same rule the canister enforces; checked here too because the receiver is
   // pasted into candid text, and a stray quote must not reshape the request.
   if (!/^(?=.{2,64}$)[a-z0-9]+([-_.][a-z0-9]+)*$/.test(receiver)) die(`not a NEAR account id: ${receiver}`);
@@ -174,7 +195,8 @@ async function cmdSend(receiver, amount) {
   }
   console.log("✓ canister builds the same bytes as @near-js/transactions");
 
-  // 2. Threshold signature on ICP (the canister also verifies it before returning).
+  // 2. Policy check, then threshold signature on ICP (the canister also
+  //    verifies it before returning). A refusal stops here: nothing is sent.
   const signed = icpCall("sign_transfer", req);
   const txB64 = field(signed, "signed_tx_base64");
   const txHash = field(signed, "tx_hash");
@@ -187,7 +209,8 @@ async function cmdSend(receiver, amount) {
   console.log(`✓ on NEAR testnet: ${EXPLORER}${txHash}`);
 }
 
-const [cmd, ...rest] = process.argv.slice(2);
+const [cmd, ...rest] = positional;
 if (cmd === "account") await cmdAccount();
+else if (cmd === "config") cmdConfig();
 else if (cmd === "send") await cmdSend(...rest);
-else die("usage: node spike.mjs account | send <receiver> <amountNEAR>");
+else die("usage: node spike.mjs account | config | send --identity <agent> <receiver> <amountNEAR>");
