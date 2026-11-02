@@ -14,10 +14,8 @@
 //      NEAR_RPC (default https://rpc.testnet.near.org)
 
 import { execFileSync } from "node:child_process";
-import { actionCreators, createTransaction, encodeTransaction } from "@near-js/transactions";
-import { PublicKey } from "@near-js/crypto";
 import { parseNearAmount } from "@near-js/utils";
-import bs58 from "bs58";
+import { referenceBytes, verifySigned } from "./verify-signed.mjs";
 
 const CANISTER = process.env.GUARD_CANISTER ?? "guard";
 const RPC = process.env.NEAR_RPC ?? "https://rpc.testnet.near.org";
@@ -176,24 +174,14 @@ async function cmdSend(receiver, amount) {
     `(record { receiver_id = "${receiver}"; yocto = "${yocto}"; ` +
     `nonce = ${nonce} : nat64; block_hash = "${blockHash}" })`;
 
-  // 1. Byte check: canister vs. NEAR's own library, before anything is signed.
-  const reference = Buffer.from(
-    encodeTransaction(
-      createTransaction(
-        accountId,
-        PublicKey.fromString(publicKey),
-        receiver,
-        nonce,
-        [actionCreators.transfer(BigInt(yocto))],
-        bs58.decode(blockHash),
-      ),
-    ),
-  ).toString("hex");
+  // 1. Early byte check, before anything is signed. `preview_transfer` is a
+  //    query (one replica), so this is only a hint; step 3 is the real check.
+  const reference = referenceBytes({ accountId, publicKey, receiver, nonce, yocto, blockHash });
   const fromCanister = okText(icpCall("preview_transfer", req));
-  if (fromCanister !== reference) {
-    die(`canister bytes differ from @near-js/transactions — not signing.\n canister:  ${fromCanister}\n near-js:   ${reference}`);
+  if (fromCanister !== reference.toString("hex")) {
+    die(`canister bytes differ from @near-js/transactions — not signing.\n canister:  ${fromCanister}\n near-js:   ${reference.toString("hex")}`);
   }
-  console.log("✓ canister builds the same bytes as @near-js/transactions");
+  console.log("✓ preview (query) matches @near-js/transactions");
 
   // 2. Policy check, then threshold signature on ICP (the canister also
   //    verifies it before returning). A refusal stops here: nothing is sent.
@@ -202,7 +190,16 @@ async function cmdSend(receiver, amount) {
   const txHash = field(signed, "tx_hash");
   console.log(`✓ signed by the subnet, tx ${txHash}`);
 
-  // 3. Submit to NEAR.
+  // 3. Check the signed bytes from the update response before they leave:
+  //    unsigned part = near-js reference, signature valid for the canister key.
+  try {
+    verifySigned({ signedTxBase64: txB64, reference, publicKey, txHash });
+  } catch (e) {
+    die(`signed transaction failed the check — not sending.\n${e.message}`);
+  }
+  console.log("✓ signed tx (update response) matches @near-js/transactions, signature verifies");
+
+  // 4. Submit to NEAR.
   const result = await rpc("send_tx", { signed_tx_base64: txB64, wait_until: "FINAL" });
   const status = result.status ?? result.final_execution_status;
   if (status?.Failure) die(`NEAR rejected it: ${JSON.stringify(status.Failure, null, 2)}`);

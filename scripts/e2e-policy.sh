@@ -11,6 +11,8 @@
 # Nothing is sent to NEAR. Requests use a fake block hash (32 zero bytes), so
 # even the signed transactions could never be accepted by any NEAR network.
 #
+# Needs `npm ci --ignore-scripts` in scripts/ once (for check-signed.mjs).
+#
 # Identities: the owner is your current icp identity (or $OWNER_IDENTITY).
 # `e2e-agent` and `e2e-stranger` are created if missing, with plaintext storage
 # (local testing only); their seed phrases are discarded, never printed.
@@ -38,6 +40,7 @@ OWNER_P=$(principal "$OWNER")
 AGENT_P=$(principal "$AGENT")
 STRANGER_P=$(principal "$STRANGER")
 [[ "$OWNER_P" != "2vxsx-fae" ]] || { echo "refusing: the owner identity is anonymous" >&2; exit 2; }
+[[ -d scripts/node_modules ]] || { echo "run: (cd scripts && npm ci --ignore-scripts)" >&2; exit 2; }
 
 NEAR=1000000000000000000000000
 yocto() { python3 -c "print(int(round($1 * 10**6)) * 10**18)"; } # NEAR (6 decimals) -> yocto
@@ -90,7 +93,9 @@ expect_err "agent signs with default policy" "per-transaction limit of 0 yocto" 
 expect_ok  "owner sets policy (0.5/tx, 0.8/day, alice+bob)" "$OWNER" set_policy "$POLICY"
 expect_err "agent changes policy" "only the owner" "$AGENT" set_policy "(record { per_tx_limit_yocto = \"$(yocto 100)\"; daily_limit_yocto = \"$(yocto 100)\"; allowlist = vec { \"attacker.testnet\" } })"
 expect_err "agent replaces agent" "only the owner" "$AGENT" set_agent "(opt principal \"$STRANGER_P\")"
-expect_err "anonymous changes policy" "only the owner" anonymous set_policy "$POLICY"
+expect_err "anonymous changes policy" "anonymous caller" anonymous set_policy "$POLICY"
+expect_err "anonymous sets agent" "anonymous caller" anonymous set_agent '(opt principal "2vxsx-fae")'
+expect_err "anonymous removes agent" "anonymous caller" anonymous set_agent '(null)'
 
 echo "== rules"
 expect_err "agent: 0.6 NEAR to alice (over per-tx)" "exceeds the per-transaction limit" "$AGENT" sign_transfer "$(req alice.testnet 0.6)"
@@ -110,20 +115,23 @@ expect_err "agent: 0.4 NEAR after 0.5 (0.9 > 0.8)" "exceeds the daily limit" "$A
 echo "== nobody but the agent signs"
 expect_err "owner signs" "owner cannot request signatures" "$OWNER" sign_transfer "$(req alice.testnet 0.1)"
 expect_err "stranger signs" "caller is not the agent" "$STRANGER" sign_transfer "$(req alice.testnet 0.1)"
-expect_err "anonymous signs" "caller is not the agent" anonymous sign_transfer "$(req alice.testnet 0.1)"
+expect_err "anonymous signs" "anonymous caller" anonymous sign_transfer "$(req alice.testnet 0.1)"
 
 echo "== reads"
 expect_ok  "agent reads config" "$AGENT" get_config '()'
-expect_err "anonymous reads config" "only the owner or the agent" anonymous get_config '()'
+expect_err "anonymous reads config" "anonymous caller" anonymous get_config '()'
+expect_err "stranger reads config" "only the owner or the agent" "$STRANGER" get_config '()'
 expect_err "stranger reads audit log" "only the owner or the agent" "$STRANGER" audit_log '()'
-expect_err "anonymous reads audit log" "only the owner or the agent" anonymous audit_log '()'
+expect_err "anonymous reads audit log" "anonymous caller" anonymous audit_log '()'
 
 CONFIG_BEFORE=$(call "$OWNER" get_config '()' | grep -v 'utc_day')
 LOG_BEFORE=$(call "$OWNER" audit_log '()')
 N_BEFORE=$(grep -c 'seq = ' <<<"$LOG_BEFORE" || true)
 grep -q "spent_today_yocto = \"$(yocto 0.5)\"" <<<"$CONFIG_BEFORE" && ok "spent today = 0.5 NEAR" || bad "spent today" "$CONFIG_BEFORE"
-# 2 before setup + 2 rules + 2 parallel + 1 daily + 3 wrong signers = 10 sign requests
-[[ "$N_BEFORE" == 10 ]] && ok "audit log has all 10 sign requests" || bad "audit log has $N_BEFORE entries, want 10" "$LOG_BEFORE"
+# Logged: default policy + 2 rules + 2 parallel + 1 daily + owner = 7.
+# Counted only (neither owner nor agent at the time): agent before setup, stranger, anonymous = 3.
+[[ "$N_BEFORE" == 7 ]] && ok "audit log has the 7 owner/agent sign requests" || bad "audit log has $N_BEFORE entries, want 7" "$LOG_BEFORE"
+grep -q 'rejected_unauthorized = 3' <<<"$CONFIG_BEFORE" && ok "3 requests from non-owner/non-agent counted, not logged" || bad "rejected_unauthorized" "$CONFIG_BEFORE"
 
 echo "== upgrade"
 upgrades() { icp canister logs guard 2>/dev/null | grep -c 'post_upgrade: state restored' || true; }
@@ -140,6 +148,20 @@ ACCOUNT_AFTER=$(call "$OWNER" account '()' | grep -o 'account_id = "[0-9a-f]*"')
 expect_err "agent: 0.4 NEAR after upgrade (budget survived)" "exceeds the daily limit" "$AGENT" sign_transfer "$(req alice.testnet 0.4)"
 expect_ok  "agent: 0.3 NEAR to alice (0.8 = limit)" "$AGENT" sign_transfer "$(req alice.testnet 0.3)"
 expect_err "agent: 1 more yocto" "exceeds the daily limit" "$AGENT" sign_transfer "(record { receiver_id = \"alice.testnet\"; yocto = \"1\"; nonce = 1 : nat64; block_hash = \"$FAKE_BLOCK\" })"
+
+echo "== signed transaction from the update response (scripts/check-signed.mjs)"
+expect_ok  "owner raises daily limit to 1 NEAR" "$OWNER" set_policy "(record { per_tx_limit_yocto = \"$(yocto 0.5)\"; daily_limit_yocto = \"$(yocto 1)\"; allowlist = vec { \"alice.testnet\"; \"bob.testnet\" } })"
+if CHECK=$(cd scripts && node check-signed.mjs --identity "$AGENT" 2>&1); then ok "check-signed: real response accepted, 5 tampered copies refused"; else bad "check-signed" "$CHECK"; fi
+echo "$CHECK" | sed 's/^/      /'
+
+echo "== agent replaced, then removed"
+expect_ok  "owner replaces agent with $STRANGER" "$OWNER" set_agent "(opt principal \"$STRANGER_P\")"
+expect_err "old agent signs" "caller is not the agent" "$AGENT" sign_transfer "$(req alice.testnet 0.01)"
+expect_ok  "new agent signs 0.01 NEAR" "$STRANGER" sign_transfer "$(req alice.testnet 0.01)"
+expect_err "old agent reads the log" "only the owner or the agent" "$AGENT" audit_log '()'
+expect_ok  "owner removes the agent" "$OWNER" set_agent '(null)'
+expect_err "removed agent signs" "no agent is set" "$STRANGER" sign_transfer "$(req alice.testnet 0.01)"
+expect_ok  "owner sets $AGENT again" "$OWNER" set_agent "(opt principal \"$AGENT_P\")"
 
 echo "== audit log (owner)"
 call "$OWNER" audit_log '()' | python3 -c '
