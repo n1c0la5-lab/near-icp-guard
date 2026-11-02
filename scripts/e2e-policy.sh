@@ -151,7 +151,7 @@ expect_err "agent: 1 more yocto" "exceeds the daily limit" "$AGENT" sign_transfe
 
 echo "== signed transaction from the update response (scripts/check-signed.mjs)"
 expect_ok  "owner raises daily limit to 1 NEAR" "$OWNER" set_policy "(record { per_tx_limit_yocto = \"$(yocto 0.5)\"; daily_limit_yocto = \"$(yocto 1)\"; allowlist = vec { \"alice.testnet\"; \"bob.testnet\" } })"
-if CHECK=$(cd scripts && node check-signed.mjs --identity "$AGENT" 2>&1); then ok "check-signed: real response accepted, 5 tampered copies refused"; else bad "check-signed" "$CHECK"; fi
+if CHECK=$(cd scripts && node check-signed.mjs --identity "$AGENT" 2>&1); then ok "check-signed: real response accepted, 6 wrong ones refused"; else bad "check-signed" "$CHECK"; fi
 echo "$CHECK" | sed 's/^/      /'
 
 echo "== agent replaced, then removed"
