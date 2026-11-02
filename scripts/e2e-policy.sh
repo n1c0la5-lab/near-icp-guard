@@ -30,7 +30,7 @@ STRANGER=e2e-stranger
 
 for id in "$AGENT" "$STRANGER"; do
   if ! icp identity list | grep -qw -- "$id"; then
-    icp identity new "$id" --storage plaintext --output-seed /dev/null >/dev/null
+    icp identity new "$id" --storage plaintext --quiet >/dev/null # stdout is the seed: discarded
   fi
 done
 principal() { icp identity principal --identity "$1"; }
