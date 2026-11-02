@@ -61,7 +61,8 @@ may sign (measured in the spike: an anonymous `sign_transfer` returned `Ok`).
 Known issue, fixed in the policy phase (`init` will reject an anonymous owner).
 
 ```bash
-icp identity new spike-local   # or any name; then select it as the default
+icp identity new my-identity       # any name
+icp identity default my-identity   # select it before `icp deploy`
 ```
 
 `spike.mjs send` refuses to sign if the canister's transaction bytes differ
