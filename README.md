@@ -217,8 +217,8 @@ And two probes against the deployed canister on the local network, with
 
 | Deliberate bug | Caught |
 |---|---|
-| reservation moved after the await | 3 checks red: both parallel requests signed |
-| `pre_upgrade` saves a fresh state | 5 checks red: config, log and budget lost |
+| reservation moved after the await | 5 checks red, first: both parallel requests signed |
+| `pre_upgrade` saves a fresh state | 6 checks red: config, log and budget lost |
 
 And two probes against the check of the signed transaction
 (`scripts/check-signed.mjs`, run against the local canister):
