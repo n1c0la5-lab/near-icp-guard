@@ -37,3 +37,20 @@ jobs:
       - run: npm ci --ignore-scripts
       - name: Vectors still match NEAR's own library
         run: npm run vectors:check
+
+  agent:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Install (scripts and agent, no install scripts)
+        run: |
+          (cd scripts && npm ci --ignore-scripts)
+          (cd agent && npm ci --ignore-scripts)
+      - name: Syntax of the entry points
+        run: node --check agent/main.mjs && node --check agent/cloud.mjs && node --check scripts/spike.mjs
+      - name: Agent tests (no network; cloud, icp and NEAR RPC are stand-ins)
+        working-directory: agent
+        run: npm test

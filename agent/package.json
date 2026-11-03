@@ -1,0 +1,12 @@
+{
+  "name": "near-icp-guard-agent",
+  "private": true,
+  "type": "module",
+  "license": "Apache-2.0",
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
+  "dependencies": {
+    "@nearai/inference-sdk": "0.2.1"
+  }
+}
