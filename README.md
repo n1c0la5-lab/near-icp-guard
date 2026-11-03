@@ -21,7 +21,8 @@ Built at NEAR HACKATHON (Nov 2026).
 3. To pay, the canister builds the NEAR transaction itself (Borsh), signs
    `sha256(tx)` with `sign_with_schnorr`, **verifies the signature locally**, and
    returns the signed transaction.
-4. `scripts/spike.mjs` (running as the agent) fetches nonce and block hash
+4. The agent side (`scripts/guard.mjs`, used by `scripts/spike.mjs` and by the
+   agent in `agent/`) fetches nonce and block hash
    from NEAR RPC and asks the canister to sign. Before it submits, it checks
    the **signed transaction from the update response**: the unsigned part must
    equal what NEAR's own library (`@near-js/transactions`) builds, byte for
@@ -325,6 +326,89 @@ And two probes against the check of the signed transaction
 | ed25519 verification skipped | 1 check red: flipped signature byte accepted |
 | byte comparison with near-js skipped | 1 check red: validly signed 2-yocto tx accepted for a 1-yocto request |
 
+## Agent
+
+A small payment agent on **NEAR AI Cloud** (`agent/`, Node 22, plain `fetch`
+through NEAR's own client). It holds no key. It has two tools:
+
+- `get_balance` — the canister's NEAR account and its testnet balance (RPC).
+- `request_payment(receiver, amount_near)` — asks the guard, as the agent's
+  icp identity, through the same code path as `spike.mjs send`
+  (`scripts/guard.mjs`: preview check, `sign_transfer`, check of the signed
+  transaction, then `send_tx`). Nothing is sent unless the canister signed and
+  the check passed. With `--dry-run` nothing is sent at all.
+
+Do this:
+
+```bash
+(cd scripts && npm ci --ignore-scripts)
+(cd agent && npm ci --ignore-scripts)
+# API key in NEARAI_API_KEY or ~/.config/near-icp-guard/nearai.key (never printed or logged)
+node agent/main.mjs --identity <agent identity> --dry-run \
+  --task "Invoice 42: please pay 0.1 NEAR to <receiver>.testnet"
+node agent/main.mjs --identity <agent identity> --task-file invoice.txt   # signs and sends
+```
+
+See this: every step goes to `agent/logs/agent.jsonl` (one JSON object per
+line): the model, the attestation result (`verified` with TCB status and
+signer, or `not verified` with the error), per completion the response
+signature status and token usage, every tool call with its arguments, the
+canister's answer (`signed` with the tx hash, or `refused` with the guard's
+reason), whether it was sent, and the tx hash if so.
+
+Before it acts, the agent checks:
+
+- **Attestation:** `InferenceClient.verify(model)` must succeed, otherwise the
+  agent stops before the first chat request.
+- **Response signature:** each completion is checked with `verifyResponse`;
+  tool calls from a response whose signature does not verify are not executed.
+- **Tool arguments:** exactly `receiver` (a NEAR account id) and `amount_near`
+  (a plain decimal *string*, at most 24 decimals); exponents, signs, JSON
+  numbers, extra fields or broken JSON are refused before the guard is asked.
+
+Measured once against NEAR AI Cloud (`deepseek-ai/DeepSeek-V4.1-Flash-1017`)
+and the canister on the **local** ICP network, with `--dry-run`, policy
+0.2 NEAR per payment and one allowed receiver: "pay 0.1 NEAR" → the guard
+signed, nothing sent (the tx hash is unknown to NEAR testnet); "pay 0.5 NEAR" →
+refused by the guard ("exceeds the per-transaction limit"), and the model
+reported the refusal. Attestation and every response signature verified
+(`provider_tee`); about 3,600 tokens for both runs.
+
+Tests without network (`cd agent && npm test`, also in CI): 31 tests with
+stand-ins for NEAR AI Cloud, `icp` and NEAR RPC — the tool call becomes exactly
+one `sign_transfer` with the right receiver and yocto amount; dry run sends
+nothing; a refusal sends nothing and is reported; a validly signed but
+different transaction is not sent; 20 kinds of broken arguments never reach
+the guard; no tool runs without verified attestation and response signature;
+the API key appears in no log line and no printed line, even when an upstream
+error echoes it. Sabotage probes, each run with one part broken:
+
+| Deliberate bug | Caught |
+|---|---|
+| amount converted wrong (×10) | 2 tests red |
+| receiver replaced by a fixed account | 2 tests red |
+| `--dry-run` ignored | 1 test red |
+| refusal reported to the model as success | 1 test red |
+| canister `Err` not detected in the `icp` output | 1 test red |
+| signed-transaction check skipped before `send_tx` | 1 test red |
+| amount format check removed | 3 tests red |
+| extra arguments allowed | 1 test red |
+| key redaction removed | 1 test red |
+| response-signature gate removed | 1 test red |
+| attestation gate removed | 2 tests red |
+
+## Built with
+
+- **NEAR AI Cloud**, model `deepseek-ai/DeepSeek-V4.1-Flash-1017` (listed as
+  verifiable, TEE), through
+  [`@nearai/inference-sdk`](https://github.com/nearai/inference-sdk) 0.2.1
+  (MIT; 63 packages in all, licenses MIT, ISC, Apache-2.0, BSD, 0BSD,
+  Unlicense, none with install scripts).
+- `@near-js/transactions`, `@near-js/crypto`, `@near-js/utils` 2.5.1 for
+  transaction reference bytes and checks; `near-api-js` 7.4.0 for NEP-413
+  vectors and `verifyMessage`; `ic-cdk` and `ed25519-dalek` in the canister.
+- The code in this repository was written with **Claude Code**.
+
 ## Proven so far (spike gate)
 
 - **Signed on ICP, accepted by NEAR testnet.** The canister signed a 0.1 NEAR
@@ -346,6 +430,16 @@ And two probes against the check of the signed transaction
   and NEAR account, NEP-413 messages (checked by near-api-js), the
   signed-transaction check, and agent replacement and removal. (The testnet transfer above was
   signed by the spike, before the policy existed.)
+- **Policy-checked transfer on NEAR testnet.** With a policy of 0.2 NEAR per
+  transfer, 2 NEAR per day and one allowed receiver, the agent identity asked
+  three times through `spike.mjs send`: `attacker.testnet` → refused (allowlist),
+  0.3 NEAR → refused (per-transaction limit), 0.1 NEAR to the allowed receiver →
+  signed and sent:
+  [`5vsrrcWfNxXBXU8sqE5BTYaycUvgEH2TzPbE6nbRhmP6`](https://testnet.nearblocks.io/txns/5vsrrcWfNxXBXU8sqE5BTYaycUvgEH2TzPbE6nbRhmP6)
+  (RPC `tx`: `SuccessValue`, `FINAL`, signer the canister's implicit account,
+  key `ed25519:265531gAWxPEFvGhDbiNhudp2X7CPmTZgvHAMScGqPbj`, `Transfer` of
+  0.1 NEAR). The canister's audit log showed all three requests with these
+  outcomes. Local ICP network, local `test_key_1`.
 
 ## Known unknowns (check before trusting)
 
@@ -353,22 +447,33 @@ And two probes against the check of the signed transaction
   Override at install with `(opt record { key_name = opt "key_1" })`.
 - **Upgrades.** Exercised on the local network only (`scripts/e2e-policy.sh`),
   not on ICP mainnet.
-- **Policy with real NEAR.** The policy has run against the local network
-  with fake block hashes; a policy-checked transfer has not yet been
-  submitted to NEAR testnet.
+- **Policy with real NEAR.** One policy-checked transfer has reached NEAR
+  testnet (above); everything else ran on the local network with fake block
+  hashes. Not on NEAR mainnet.
 - **Audit log flooding by the agent.** Strangers are only counted, but the
   agent itself (for example a compromised one) can still fill the ring buffer
   with rejected requests and push older entries out; `seq` shows that it
   happened, the evicted entries are gone.
-- **`spike.mjs` wiring.** `check-signed.mjs` tests the check function against
-  the real canister; that `spike.mjs send` calls it before `send_tx` was seen
-  against a local stand-in RPC, not against NEAR testnet yet.
+- **Signed-transaction check before `send_tx`.** `check-signed.mjs` tests the
+  check function against the real canister. That `guard.mjs` (behind
+  `spike.mjs send` and the agent) runs it before `send_tx` is tested with
+  stand-ins for `icp` and NEAR RPC (`agent/test`: a validly signed but
+  different transaction is not sent; removing the check turns that test red),
+  not against NEAR testnet.
 - **Other NEP-413 recipients.** Only `intents.near` is refused by name. Any
   other recipient that treats a NEP-413 signature as an authorization to move
   funds is not known to the canister; which recipients to list is the owner's
   call.
 - **NEP-413 messages are not used by anything yet.** They are signed and
   verified locally; no recipient has consumed one.
+- **The agent's SDK on Node 22.** `@nearai/inference-sdk` 0.2.1 declares Node
+  ≥ 24.22.1. The agent ran on Node 22.23.4: attestation, chat and response
+  verification worked in the two runs above; other SDK paths were not tried.
+- **What the agent does not verify.** The SDK verifies the Gateway and model
+  attestation reports (TDX quote, TCB status, signer) and each response
+  signature. It does **not** check *which* deployment runs (no image-provenance
+  or deployment policy is configured): the log says `deployment_provenance:
+  "not verified"`. End-to-end encryption of the chat (`e2ee`) is off.
 - **ICP mainnet.** Nothing here has run on ICP mainnet.
 
 ## License
