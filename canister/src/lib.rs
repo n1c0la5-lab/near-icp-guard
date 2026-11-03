@@ -9,6 +9,7 @@
 //! Roles and rules live in [`policy`] as pure code; this file is the IC glue.
 
 pub mod near_tx;
+pub mod nep413;
 pub mod policy;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
@@ -20,6 +21,7 @@ use ic_cdk_management_canister::{
     SignWithSchnorrArgs,
 };
 use near_tx::{decode_block_hash, implicit_account_id, validate_account_id, Transfer};
+use nep413::Payload;
 use policy::{parse_yocto, AuditEntry, Config, Guard, Policy};
 use std::cell::RefCell;
 
@@ -60,6 +62,28 @@ pub struct SignedTransfer {
     pub signed_tx_base64: String,
     /// Base58 of the signing hash — NEAR's transaction id.
     pub tx_hash: String,
+}
+
+/// A NEP-413 message to sign (fields as in NEP-413's `signMessage`).
+#[derive(CandidType, Deserialize)]
+pub struct Nep413Request {
+    pub message: String,
+    /// Exactly 32 bytes.
+    pub nonce: Vec<u8>,
+    pub recipient: String,
+    pub callback_url: Option<String>,
+}
+
+/// NEP-413's `SignedMessage`.
+#[derive(CandidType, Deserialize)]
+pub struct SignedMessage {
+    /// The canister's implicit account.
+    pub account_id: String,
+    /// `ed25519:<base58>`.
+    pub public_key: String,
+    /// Base64 of the 64-byte Ed25519 signature over
+    /// `sha256(u32 2^31+413 || borsh(payload))`, as NEP-413 returns it.
+    pub signature: String,
 }
 
 struct State {
@@ -188,11 +212,11 @@ fn preview_transfer(req: TransferRequest) -> Result<String, String> {
     Ok(hex::encode(build(&req, yocto)?.encode()))
 }
 
-/// Builds, signs and verifies. Only called after the policy admitted the request.
-async fn sign(req: &TransferRequest, yocto: u128) -> Result<SignedTransfer, String> {
-    let tx = build(req, yocto)?;
-    let hash = tx.signing_hash();
-
+/// Threshold-signs a 32-byte hash and verifies the signature against `pk`
+/// before returning it: if ICP signed something other than what NEAR will
+/// check (e.g. a pre-hashed variant), this fails with a clear message instead
+/// of an opaque "InvalidSignature" later.
+async fn threshold_sign(hash: &[u8; 32], pk: &[u8; 32]) -> Result<[u8; 64], String> {
     let res = sign_with_schnorr(&SignWithSchnorrArgs {
         message: hash.to_vec(),
         derivation_path: vec![DERIVATION_PATH.to_vec()],
@@ -205,13 +229,17 @@ async fn sign(req: &TransferRequest, yocto: u128) -> Result<SignedTransfer, Stri
         .signature
         .try_into()
         .map_err(|v: Vec<u8>| format!("expected 64-byte signature, got {} bytes", v.len()))?;
-
-    // Verify before returning: if ICP signed something other than what NEAR
-    // will check (e.g. a pre-hashed variant), fail here with a clear message
-    // instead of getting an opaque "InvalidSignature" from the network.
-    let vk = VerifyingKey::from_bytes(&tx.public_key).map_err(|e| format!("bad key: {e}"))?;
-    vk.verify_strict(&hash, &Signature::from_bytes(&sig))
+    let vk = VerifyingKey::from_bytes(pk).map_err(|e| format!("bad key: {e}"))?;
+    vk.verify_strict(hash, &Signature::from_bytes(&sig))
         .map_err(|e| format!("threshold signature does not verify over the NEAR hash: {e}"))?;
+    Ok(sig)
+}
+
+/// Builds, signs and verifies. Only called after the policy admitted the request.
+async fn sign(req: &TransferRequest, yocto: u128) -> Result<SignedTransfer, String> {
+    let tx = build(req, yocto)?;
+    let hash = tx.signing_hash();
+    let sig = threshold_sign(&hash, &tx.public_key).await?;
 
     Ok(SignedTransfer {
         signed_tx_base64: BASE64.encode(tx.encode_signed(&sig)),
@@ -238,13 +266,61 @@ async fn sign_transfer(req: TransferRequest) -> Result<SignedTransfer, String> {
     result
 }
 
+/// Agent only. Signs a NEP-413 message if its recipient is on the owner's
+/// NEP-413 allowlist (never for `policy::FORBIDDEN_NEP413_RECIPIENTS`).
+/// Every request from owner or agent is logged with recipient, message length
+/// and hash, nonce and outcome.
+#[ic_cdk::update]
+async fn sign_message(req: Nep413Request) -> Result<SignedMessage, String> {
+    let caller = msg_caller();
+    let now = time();
+    let ticket = with_state(|s| {
+        s.guard.begin_message(
+            caller,
+            &req.message,
+            &req.nonce,
+            &req.recipient,
+            req.callback_url.as_deref(),
+            now,
+        )
+    })
+    .map_err(|r| r.to_string())?;
+    let result = async {
+        let pk = with_state(|s| s.public_key).ok_or("call `account` once first")?;
+        let hash = Payload {
+            message: &req.message,
+            nonce: ticket.nonce(),
+            recipient: &req.recipient,
+            callback_url: req.callback_url.as_deref(),
+        }
+        .signing_hash();
+        let sig = threshold_sign(&hash, &pk).await?;
+        let account = account_of(&pk);
+        Ok::<_, String>((
+            SignedMessage {
+                account_id: account.account_id,
+                public_key: account.public_key_near,
+                signature: BASE64.encode(sig),
+            },
+            bs58::encode(hash).into_string(),
+        ))
+    }
+    .await;
+    let logged = match &result {
+        Ok((_, hash)) => Ok(hash.clone()),
+        Err(e) => Err(e.clone()),
+    };
+    with_state(|s| s.guard.finish_message(ticket, logged));
+    result.map(|(signed, _)| signed)
+}
+
 /// Owner only. `null` removes the agent.
 #[ic_cdk::update]
 fn set_agent(agent: Option<Principal>) -> Result<(), String> {
     with_state(|s| s.guard.set_agent(msg_caller(), agent)).map_err(|e| e.to_string())
 }
 
-/// Owner only. Replaces all three rules at once.
+/// Owner only. Replaces all three rules and the NEP-413 recipient list at once.
 #[ic_cdk::update]
 fn set_policy(policy: Policy) -> Result<(), String> {
     with_state(|s| s.guard.set_policy(msg_caller(), &policy)).map_err(|e| e.to_string())

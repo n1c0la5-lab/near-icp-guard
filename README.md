@@ -5,8 +5,10 @@ An ICP canister that owns a NEAR account and signs NEAR transactions with a
 exists in one place. An AI agent can *ask* for a payment; it never holds a key.
 
 Before it signs, the canister checks a **policy** the agent cannot change:
-a per-transaction limit, a daily limit and a receiver allowlist. Every request,
-signed or rejected, goes into an audit log.
+a per-transaction limit, a daily limit and a receiver allowlist. Off-chain
+**NEP-413** messages get their own rule (a separate recipient allowlist;
+`intents.near` is always refused). Every request, signed or rejected, goes into
+an audit log.
 
 Built at NEAR HACKATHON (Nov 2026).
 
@@ -39,17 +41,18 @@ paid to whom.
 | Role | Who | May | May not |
 |---|---|---|---|
 | owner | the identity that installed the canister | set the agent (`set_agent`), set the policy (`set_policy`), read config and log | request signatures |
-| agent | one principal, set by the owner | request signatures (`sign_transfer`), read config and log | change the policy, change the agent |
+| agent | one principal, set by the owner | request signatures (`sign_transfer`, `sign_message`), read config and log | change the policy, change the agent |
 | anyone else | — | `account`, `preview_transfer` (signs nothing) | sign, set, read config or log |
 
 `init` refuses the anonymous principal as owner: the install traps and nothing
-is installed. Every protected method (`sign_transfer`, `set_agent`,
-`set_policy`, `get_config`, `audit_log`) refuses an anonymous caller
-explicitly. The agent can never be the owner or the anonymous principal.
+is installed. Every protected method (`sign_transfer`, `sign_message`,
+`set_agent`, `set_policy`, `get_config`, `audit_log`) refuses an anonymous
+caller explicitly. The agent can never be the owner or the
+anonymous principal.
 The owner can replace the agent (`set_agent(opt <new>)`) or remove it
 (`set_agent(null)`); the old agent cannot sign from that moment on.
 
-**Rules**, checked before every signature, in this order:
+**Rules**, checked before every transfer signature, in this order:
 
 1. **Per-transaction limit**: amount > limit ⇒ rejected.
 2. **Receiver allowlist**: receiver not on the list ⇒ rejected. Entries must be
@@ -83,21 +86,83 @@ stranger cannot push the real entries out of the ring buffer. Owner and agent
 read the log with `audit_log` (a query call, answered by one replica and not
 certified).
 
-**Upgrades** keep owner, agent, policy, today's spent amount, the counter and
-the audit log: `pre_upgrade` writes them to stable memory as one candid value
-(`stable_save`). That value is bounded: a test fills the log and the
-allowlist with maximum-size entries and measures 498,289 bytes
-(`policy::tests::worst_case_state_size`). Upgrading the spike version to this one is refused
+**Upgrades** keep owner, agent, policy (including the NEP-413 list), today's
+spent amount, the counter and the audit log: `pre_upgrade` writes them to
+stable memory as one candid value (`stable_save`). That value is bounded: a
+test fills both allowlists and the log with maximum-size entries and measures
+835,449 bytes (`policy::tests::worst_case_state_size`). State saved by the
+previous version (without the NEP-413 fields) still restores, with an empty
+NEP-413 list (`policy::tests::state_from_before_nep413_still_decodes`; measured
+locally: an upgrade of a canister running the previous version kept its policy
+and its 16 log entries). Upgrading the spike version to this one is refused
 (`post_upgrade` traps and the upgrade rolls back, measured locally): reinstall
 instead. The NEAR account stays the same either way, because the key depends
 on the canister id, not on its state.
+
+## NEP-413 messages
+
+[NEP-413](https://github.com/near/NEPs/blob/master/neps/nep-0413.md) lets an
+account sign an off-chain message for a `recipient`. Signed with this
+account's full-access key, such a message is an authorization wherever the
+recipient accepts one. NEAR Intents (`intents.near`) is such a recipient: it
+executes NEP-413-signed intents, including withdrawals to any address, when the
+signing key belongs to the signer's account. If the canister signed any message the
+agent asked for, the agent could move funds without ever passing the three
+transfer rules. So messages have their own rule:
+
+- `sign_message(record { message; nonce : blob; recipient; callback_url : opt text })`,
+  agent only, same roles as `sign_transfer`.
+- The `recipient` must be on `nep413_recipients`, a list in the policy that is
+  **separate from the transfer allowlist** and set by the owner with
+  `set_policy` (`null` or left out = empty = nothing signed; at most 20
+  entries). The transfer allowlist does not count for messages and vice versa.
+- **`intents.near` is always refused**, compared case-insensitively. `set_policy`
+  refuses a list that contains it, so the owner learns it at once, and
+  `sign_message` refuses it again, so the rule does not depend on how the list
+  was built (a test puts it on the list directly and checks the refusal).
+- Bounds: nonce exactly 32 bytes; message 1 to 4096 bytes; recipient 1 to 128
+  printable ASCII characters without spaces; `callback_url` at most 512 of
+  them.
+- **A nonce may be signed more than once.** Under NEP-413, replay protection
+  is the recipient's job: only it knows which nonces it accepted. The guard's
+  protection is the recipient list, and a canister-side record of used nonces
+  would have to be bounded, so it could only ever be partial.
+- Encoding exactly as in NEP-413: `u32` tag 2^31 + 413 (little-endian),
+  then Borsh `{ message: string, nonce: [u8; 32], recipient: string,
+  callbackUrl: Option<string> }`; SHA-256 of that is signed with
+  `sign_with_schnorr` (Ed25519), and the canister **verifies the signature
+  itself** before returning it, as for transfers.
+- Returns NEP-413's `SignedMessage`: `account_id` (the implicit account),
+  `public_key` (`ed25519:<base58>`) and `signature` (base64 of the 64 bytes).
+- **Audit log:** every request from owner or agent, signed or refused, with
+  recipient, message length and SHA-256 (not the message itself), nonce,
+  callback URL (clipped) and outcome (`MessageSigned` with the base58 payload
+  hash, or `Rejected` with the reason). Strangers are counted, not logged.
+
+**Checked against NEAR's own library.** `scripts/nep413-vector.mjs` signs
+messages with near-api-js (`KeyPairSigner.signNep413Message`, fixed test keys)
+and writes `canister/tests/vectors/nep413.json`; `canister/tests/nep413_vectors.rs`
+verifies each of those signatures over the hash *our* encoder computes (cases:
+no callback, a callback, `Some("")`, multi-byte text, maximum sizes). On the
+local network, `scripts/check-nep413.mjs` has the canister sign three messages
+and checks them with near-api-js's verifier (`verifyMessage` from
+`near-api-js/nep413`); six altered payloads or signatures must fail. Measured
+once with `NEAR_RPC=https://rpc.testnet.near.org`, where `verifyMessage` also
+confirmed on testnet that the canister's key is a full-access key of its
+account; by default (and in `e2e-policy.sh`) that lookup is answered by a
+stand-in, so only the signature is checked.
+
+**Why not a function-call access key?** NEAR's function-call keys limit *which
+contract methods* a key may call; they cannot transfer NEAR, and they do not
+limit how much goes to whom. Paying from an account takes a full-access key, so
+the canister holds one and puts its own limits in front of it.
 
 **What the policy does not cover.** The policy binds callers of the canister,
 not its **controllers**: a controller can install different code. Who controls
 the canister is set at deploy time (`icp canister status guard` lists them).
 
 **Not built:** time windows, multi-signature approval, rate limits per minute,
-more than one agent, tokens other than NEAR.
+more than one agent, tokens other than NEAR, executing NEAR Intents.
 
 ## Run it
 
@@ -129,6 +194,8 @@ icp canister call guard set_policy '(record { per_tx_limit_yocto = "500000000000
 # then, as the agent:
 node spike.mjs send --identity <agent identity> <receiver>.testnet 0.1
 node spike.mjs config --identity <agent identity>   # policy and today's spent amount
+# NEP-413: the owner lists the recipient (nep413_recipients in set_policy), then the agent asks:
+icp canister call guard sign_message '(record { message = "hello"; nonce = blob "<32 bytes>"; recipient = "<app>"; callback_url = null })' --identity <agent identity>
 ```
 
 `scripts/e2e-policy.sh` (needs `npm ci --ignore-scripts` in `scripts/` once)
@@ -136,7 +203,10 @@ reinstalls `guard` on the local network (state wiped, same NEAR account),
 creates the identities `e2e-agent` and `e2e-stranger` if missing (plaintext
 storage, local only), and checks roles, anonymous on every protected method,
 the three rules, two parallel requests, the audit log and its counter, an
-upgrade, the check of the signed transaction (`scripts/check-signed.mjs`:
+upgrade (which must keep the NEP-413 list), NEP-413 messages (`intents.near`
+refused in the policy and at signing, unlisted recipients, wrong nonce
+lengths, roles, a signed message checked by near-api-js via
+`scripts/check-nep413.mjs`, log entries), the check of the signed transaction (`scripts/check-signed.mjs`:
 the real response passes, six tampered or different ones are refused), and
 replacing and removing the agent. Its signed transactions use a fake block
 hash (32 zero bytes), so no NEAR network would accept them.
@@ -181,7 +251,20 @@ Sabotage probes for the encoder, each caught by the tests:
 | `guard.did` out of sync with the code | 1 test red |
 
 Regenerate vectors only with `npm run vectors`, never by hand.
-`npm run vectors:check` fails if the library and the checked-in file disagree.
+`npm run vectors:check` (run in CI) fails if the libraries and the checked-in
+files disagree. Transaction vectors come from `@near-js/transactions` 2.5.1,
+NEP-413 vectors from `near-api-js` 7.4.0 (license `(MIT AND Apache-2.0)`).
+
+Sabotage probes for the NEP-413 encoder, each caught by the tests:
+
+| Deliberate bug | Caught |
+|---|---|
+| tag 413 instead of 2^31 + 413 | 2 tests red, among them the near-api-js vectors |
+| tag big-endian | 2 tests red, among them the near-api-js vectors |
+| `callbackUrl` `None` encoded as nothing | 2 tests red, among them the near-api-js vectors |
+| `callbackUrl` `Some` without its tag byte | 2 tests red, among them the near-api-js vectors |
+| recipient before nonce | 2 tests red, among them the near-api-js vectors |
+| message length counted in characters, not bytes | 1 test red: the near-api-js vectors |
 
 The policy is pure code (`canister/src/policy.rs`: no IC calls, time passed in),
 so every rule is tested natively. Sabotage probes for the policy, each run on a
@@ -211,6 +294,16 @@ copy with one rule broken (`cargo test --no-fail-fast`, 33 tests):
 | anyone may read config and log | 1 test red |
 | audit log unbounded | 3 tests red |
 | `guard.did` out of sync (`audit_log` removed) | 1 test red |
+| NEP-413: `intents.near` check at signing removed | 2 tests red |
+| NEP-413: `intents.near` check in `set_policy` removed | 1 test red |
+| NEP-413: recipient allowlist check removed | 2 tests red |
+| NEP-413: checked against the transfer allowlist instead | 8 tests red |
+| NEP-413: owner may sign messages | 1 test red |
+| NEP-413: anyone may sign messages | 1 test red |
+| NEP-413: strangers written into the log | 1 test red |
+| NEP-413: nonce length not checked (padded to 32) | 2 tests red |
+| NEP-413: message length not bounded | 1 test red |
+| NEP-413: refused messages not logged | 3 tests red |
 
 And two probes against the deployed canister on the local network, with
 `scripts/e2e-policy.sh`:
@@ -219,6 +312,10 @@ And two probes against the deployed canister on the local network, with
 |---|---|
 | reservation moved after the await | 5 checks red, first: both parallel requests signed |
 | `pre_upgrade` saves a fresh state | 6 checks red: config, log and budget lost |
+| `pre_upgrade` drops the NEP-413 list | 7 checks red, first: config changed |
+| canister signs NEP-413 with tag 413 | 1 check red: near-api-js `verifyMessage` refuses all 3 signatures |
+| canister encodes `callbackUrl` `None` as nothing | 1 check red: near-api-js refuses the message without callback |
+| `check-nep413.mjs` skips `verifyMessage` | 1 check red: 6 altered messages accepted |
 
 And two probes against the check of the signed transaction
 (`scripts/check-signed.mjs`, run against the local canister):
@@ -242,11 +339,12 @@ And two probes against the check of the signed transaction
 - `test_key_1` exists on the local network; `account` returns the same NEAR
   account before and after a reinstall.
 - `spike.mjs` parses the `icp` output (`account`, `send`).
-- **Policy on the local network.** `scripts/e2e-policy.sh` passes all 45 checks:
+- **Policy on the local network.** `scripts/e2e-policy.sh` passes all 61 checks:
   default deny, roles, anonymous refused on every protected method, the three
   rules, two parallel requests of which exactly one is signed, the audit log,
-  an upgrade that keeps owner, agent, policy, spent amount, log and NEAR
-  account, the signed-transaction check, and agent replacement and removal. (The testnet transfer above was
+  an upgrade that keeps owner, agent, policy, NEP-413 list, spent amount, log
+  and NEAR account, NEP-413 messages (checked by near-api-js), the
+  signed-transaction check, and agent replacement and removal. (The testnet transfer above was
   signed by the spike, before the policy existed.)
 
 ## Known unknowns (check before trusting)
@@ -265,6 +363,12 @@ And two probes against the check of the signed transaction
 - **`spike.mjs` wiring.** `check-signed.mjs` tests the check function against
   the real canister; that `spike.mjs send` calls it before `send_tx` was seen
   against a local stand-in RPC, not against NEAR testnet yet.
+- **Other NEP-413 recipients.** Only `intents.near` is refused by name. Any
+  other recipient that treats a NEP-413 signature as an authorization to move
+  funds is not known to the canister; which recipients to list is the owner's
+  call.
+- **NEP-413 messages are not used by anything yet.** They are signed and
+  verified locally; no recipient has consumed one.
 - **ICP mainnet.** Nothing here has run on ICP mainnet.
 
 ## License
