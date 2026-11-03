@@ -12,7 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createGuard } from "../../scripts/guard.mjs";
 import { referenceBytes } from "../../scripts/verify-signed.mjs";
-import { parsePaymentArgs, runAgent } from "../agent.mjs";
+import { ArgumentError, parsePaymentArgs, runAgent } from "../agent.mjs";
 import { createLog } from "../log.mjs";
 
 // ---- helpers ------------------------------------------------------------------
@@ -240,6 +240,21 @@ for (const [label, args] of BAD_ARGS) {
     assert.equal(call.sent, false);
   });
 }
+
+/** The agent's own type check, not the conversion behind it, refuses non-strings. */
+test("amount_near that is not a string is refused by the agent's type check", async () => {
+  for (const amount of [0.1, 1, 1e3, null, true, ["0.1"], { v: "0.1" }]) {
+    assert.throws(
+      () => parsePaymentArgs({ receiver: "bob.testnet", amount_near: amount }),
+      (e) => e instanceof ArgumentError && e.message === 'amount_near must be a string such as "0.1"',
+      JSON.stringify(amount),
+    );
+  }
+  const t = setup({ script: [pay({ receiver: "bob.testnet", amount_near: 0.1 })] });
+  await t.run();
+  const toolMsg = t.cloud.requests[1].messages.find((m) => m.role === "tool");
+  assert.deepEqual(JSON.parse(toolMsg.content), { ok: false, error: 'invalid arguments: amount_near must be a string such as "0.1"' });
+});
 
 test("plain decimal amounts are accepted and converted exactly", () => {
   assert.equal(parsePaymentArgs('{"receiver":"bob.testnet","amount_near":"0.1"}').yocto, "100000000000000000000000");
