@@ -374,12 +374,12 @@ refused by the guard ("exceeds the per-transaction limit"), and the model
 reported the refusal. Attestation and every response signature verified
 (`provider_tee`); about 3,600 tokens for both runs.
 
-Tests without network (`cd agent && npm test`, also in CI): 31 tests with
+Tests without network (`cd agent && npm test`, also in CI): 32 tests with
 stand-ins for NEAR AI Cloud, `icp` and NEAR RPC — the tool call becomes exactly
 one `sign_transfer` with the right receiver and yocto amount; dry run sends
 nothing; a refusal sends nothing and is reported; a validly signed but
 different transaction is not sent; 20 kinds of broken arguments never reach
-the guard; no tool runs without verified attestation and response signature;
+the guard, and a non-string amount is refused by the agent's own check; no tool runs without verified attestation and response signature;
 the API key appears in no log line and no printed line, even when an upstream
 error echoes it. Sabotage probes, each run with one part broken:
 
@@ -393,6 +393,7 @@ error echoes it. Sabotage probes, each run with one part broken:
 | signed-transaction check skipped before `send_tx` | 1 test red |
 | amount format check removed | 3 tests red |
 | extra arguments allowed | 1 test red |
+| agent's own string check for `amount_near` removed | 1 test red |
 | key redaction removed | 1 test red |
 | response-signature gate removed | 1 test red |
 | attestation gate removed | 2 tests red |
