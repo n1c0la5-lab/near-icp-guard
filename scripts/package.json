@@ -4,8 +4,8 @@
   "type": "module",
   "license": "Apache-2.0",
   "scripts": {
-    "vectors": "node reference-vector.mjs",
-    "vectors:check": "node reference-vector.mjs && git diff --exit-code -- ../canister/tests/vectors/near-tx.json",
+    "vectors": "node reference-vector.mjs && node nep413-vector.mjs",
+    "vectors:check": "node reference-vector.mjs && node nep413-vector.mjs && git diff --exit-code -- ../canister/tests/vectors/",
     "account": "node spike.mjs account",
     "send": "node spike.mjs send"
   },
@@ -13,6 +13,7 @@
     "@near-js/crypto": "2.5.1",
     "@near-js/transactions": "2.5.1",
     "@near-js/utils": "2.5.1",
-    "bs58": "6.0.0"
+    "bs58": "6.0.0",
+    "near-api-js": "7.4.0"
   }
 }
