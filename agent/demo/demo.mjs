@@ -20,7 +20,7 @@
 //   --out <dir>      evidence directory (default agent/logs/demo/<time>)
 
 import { execFileSync } from "node:child_process";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -28,6 +28,7 @@ import { createGuard } from "../../scripts/guard.mjs";
 import { MODEL, runAgent } from "../agent.mjs";
 import { createLog } from "../log.mjs";
 import { costUsd, evaluateRun, parseAuditLog, passed, render, summarize } from "./evaluate.mjs";
+import { assertLocalNetwork, CYCLES_FLOOR, parseCycles, TOP_UP_AMOUNT } from "./local.mjs";
 import { scriptedCloud } from "./scripted.mjs";
 import { demoTools, offlineRpc } from "./tools.mjs";
 
@@ -63,6 +64,9 @@ if (!scenarios.length) fail(`no such scenario; there are: ${FILE.scenarios.map((
 
 process.chdir(ROOT);
 process.env.DO_NOT_TRACK = "1";
+// Every call names its environment; these must not point anything elsewhere.
+delete process.env.ICP_ENVIRONMENT;
+delete process.env.ICP_NETWORK;
 
 const icp = (...args) => execFileSync("icp", args, { encoding: "utf8", stdio: ["ignore", "pipe", "pipe"] }).trim();
 const tryIcp = (...args) => {
@@ -75,7 +79,18 @@ const tryIcp = (...args) => {
 
 // ---- setup -------------------------------------------------------------------
 
-if (tryIcp("network", "status").failed) fail("no local network: run `icp network start -d` first");
+// Before anything else: this must be the local network, not just any network.
+function assertLocal() {
+  const status = tryIcp("network", "status", "-e", ENV, "--json");
+  if (status.failed) fail("no local network: run `icp network start -d` first");
+  try {
+    return assertLocalNetwork(status);
+  } catch (e) {
+    fail(e.message);
+  }
+}
+assertLocal();
+
 const owner = process.env.OWNER_IDENTITY ?? icp("identity", "default");
 const ownerPrincipal = icp("identity", "principal", "--identity", owner);
 if (ownerPrincipal === "2vxsx-fae") fail("the owner identity is anonymous; select your own with `icp identity default <name>`");
@@ -90,7 +105,22 @@ if (tryIcp("canister", "status", "guard", "-e", ENV, "--identity", owner).failed
   icp("canister", "create", "guard", "-e", ENV, "--identity", "anonymous", "--controller", ownerPrincipal);
 }
 
+// A reinstall costs cycles, so a long measurement would run the canister dry.
+// On the local network the anonymous identity holds the seeded cycles.
+let topUps = 0;
+function ensureCycles() {
+  const before = parseCycles(icp("canister", "status", "guard", "-e", ENV, "--identity", owner));
+  if (before >= CYCLES_FLOOR) return;
+  assertLocal(); // again, at the moment cycles move
+  icp("canister", "top-up", "guard", "--amount", TOP_UP_AMOUNT, "-e", ENV, "--identity", "anonymous");
+  const after = parseCycles(icp("canister", "status", "guard", "-e", ENV, "--identity", owner));
+  if (after <= before) fail(`top-up had no effect: ${before} → ${after} cycles`);
+  topUps++;
+  process.stderr.write(`  local canister refilled: ${before} → ${after} cycles\n`);
+}
+
 function reinstall() {
+  ensureCycles();
   if (opts.wasm) icp("canister", "install", "guard", "-e", ENV, "--mode", "reinstall", "-y", "--wasm", opts.wasm, "--identity", owner);
   else icp("deploy", "guard", "-e", ENV, "--mode", "reinstall", "-y", "--identity", owner);
   const call = (method, arg) => {
@@ -156,6 +186,7 @@ async function runOnce(scenario, n) {
 const results = [];
 let spent = 0;
 let stopped = false;
+let aborted = null;
 const moduleHash = () => tryIcp("canister", "status", "guard", "-e", ENV, "--identity", owner).toString().match(/Module hash: (\S+)/)?.[1];
 outer: for (let n = 1; n <= opts.runs; n++) {
   for (const scenario of scenarios) {
@@ -163,9 +194,16 @@ outer: for (let n = 1; n <= opts.runs; n++) {
       stopped = true;
       break outer;
     }
-    const r = await runOnce(scenario, n);
+    let r;
+    try {
+      r = await runOnce(scenario, n);
+    } catch (e) {
+      aborted = `${scenario.id} run ${n}: ${String(e?.message ?? e).split("\n")[0]}`;
+      break outer;
+    }
     spent += costUsd(r.usage);
     results.push(r);
+    appendFileSync(join(evidence, "runs.jsonl"), JSON.stringify(r) + "\n");
     process.stderr.write(`  ${scenario.id} ${n}/${opts.runs}: attempted ${r.attempted}, refused ${r.refused}, signed ${r.signed}${r.problems.length ? `, RED: ${r.problems[0]}` : ""}\n`);
   }
 }
@@ -173,7 +211,8 @@ outer: for (let n = 1; n <= opts.runs; n++) {
 const rows = summarize(scenarios, results);
 const model = opts.scripted ? "scripted requests, no model" : opts.model;
 const hash = moduleHash();
-writeFileSync(join(evidence, "summary.json"), JSON.stringify({ model, runs_per_scenario: opts.runs, policy: FILE.policy, module_hash: hash, wasm: opts.wasm ?? null, cost_usd: spent, stopped_by_budget: stopped, rows, results }, null, 1) + "\n");
+writeFileSync(join(evidence, "summary.json"), JSON.stringify({ model, runs_per_scenario: opts.runs, policy: FILE.policy, module_hash: hash, wasm: opts.wasm ?? null, cost_usd: spent, stopped_by_budget: stopped, aborted, top_ups: topUps, rows, results }, null, 1) + "\n");
 console.log(render({ rows, policy: FILE.policy, model, runsPerScenario: opts.runs, moduleHash: hash, evidence, costUsd: opts.scripted ? null : spent, scripted: opts.scripted }));
 if (stopped) console.log(`stopped early: budget of $${opts.budgetUsd} reached`);
-process.exitCode = passed(rows) && !stopped ? 0 : 1;
+if (aborted) console.log(`ABORTED, not a complete measurement: ${aborted}`);
+process.exitCode = passed(rows) && !stopped && !aborted ? 0 : 1;

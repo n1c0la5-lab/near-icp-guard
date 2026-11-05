@@ -9,6 +9,7 @@ import { readFileSync } from "node:fs";
 import { createGuard, nearToYocto } from "../../scripts/guard.mjs";
 import { MODEL, runAgent, TOOLS } from "../agent.mjs";
 import { attempted, evaluateRun, parseAuditLog, passed, render, summarize, violations } from "../demo/evaluate.mjs";
+import { assertLocalNetwork, CYCLES_FLOOR, parseCycles } from "../demo/local.mjs";
 import { scriptedCloud } from "../demo/scripted.mjs";
 import { demoTools, offlineRpc, OFFLINE_BLOCK_HASH, signMessage } from "../demo/tools.mjs";
 
@@ -229,6 +230,31 @@ test("a message from the model cannot reshape the candid request", () => {
   signMessage({ icpCall: (m, a) => calls.push([m, a]) }, { recipient: "login.example", message: 'x"; recipient = "evil', nonce: Buffer.alloc(32, 255) });
   assert.equal(calls[0][0], "sign_message");
   assert.match(calls[0][1], /message = "x\\"; recipient = \\"evil"; nonce = blob "(\\ff){32}"; recipient = "login\.example"/);
+});
+
+// Real `icp network status --json`: the local network, and `network: ic` in icp.yaml.
+const LOCAL_STATUS = { managed: true, api_url: "http://localhost:8010/", gateway_url: "http://localhost:8010/", root_key_source: "managed" };
+
+test("the demo accepts only a managed network on this machine", () => {
+  assert.equal(assertLocalNetwork(JSON.stringify(LOCAL_STATUS)), "http://localhost:8010/");
+  assert.equal(assertLocalNetwork(JSON.stringify({ ...LOCAL_STATUS, api_url: "http://127.0.0.1:8010/" })), "http://127.0.0.1:8010/");
+  const refused = [
+    { managed: false, api_url: "https://icp-api.io/" }, // mainnet
+    { api_url: "https://icp-api.io/" }, // `managed` missing
+    { managed: true, api_url: "https://icp-api.io/" }, // managed, but elsewhere
+    { managed: false, api_url: "http://localhost:8010/" }, // here, but connected (a tunnel)
+    { managed: true, api_url: "http://localhost.icp-api.io/" },
+    { managed: true },
+  ];
+  for (const s of refused) assert.throws(() => assertLocalNetwork(JSON.stringify(s)), undefined, JSON.stringify(s));
+  assert.throws(() => assertLocalNetwork("Api Url: http://localhost:8010/"));
+});
+
+test("cycles balance: the canister's own line, never the reserved one", () => {
+  const status = "  Status: Running\n  Reserved cycles limit: 5_000_000_000_000\n  Cycles: 323_235_254_318\n  Reserved cycles: 0\n";
+  assert.equal(parseCycles(status), 323235254318n);
+  assert.ok(parseCycles(status) < CYCLES_FLOOR, "the balance that ended the first measurement must count as too low");
+  assert.throws(() => parseCycles("  Status: Running\n  Reserved cycles: 0\n"));
 });
 
 // ---- a whole run through the real agent loop -----------------------------------
