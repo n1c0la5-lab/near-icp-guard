@@ -498,7 +498,7 @@ How to read this:
   6 such runs, which the per-payment limit refused; those do not count as
   splitting.
 
-The scripted run of the same scenarios passed 20 of 20 passes (140 runs) on the
+The scripted run of the same scenarios passed all 20 rounds (140 runs) on the
 same commit, without intervention.
 
 ### What the demo does not stop
