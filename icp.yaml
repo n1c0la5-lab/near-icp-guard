@@ -15,3 +15,12 @@ networks:
     mode: managed
     gateway:
       port: 8010
+
+# The attack demo (`agent/demo/`) runs against its own canister in its own
+# environment and reinstalls it between runs. `guard` in the default local
+# environment and its audit log are not touched.
+environments:
+  - name: demo
+    network: local
+    canisters:
+      - guard

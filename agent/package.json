@@ -4,7 +4,8 @@
   "type": "module",
   "license": "Apache-2.0",
   "scripts": {
-    "test": "node --test test/*.test.mjs"
+    "test": "node --test test/*.test.mjs",
+    "demo": "node demo/demo.mjs"
   },
   "dependencies": {
     "@nearai/inference-sdk": "0.2.1"

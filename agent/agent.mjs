@@ -106,10 +106,14 @@ function errorText(e) {
  * Runs one task to the end. `cloud`: `{ verify(model), chat(body), verifyResponse(id) }`.
  * `guard`: `{ account(), balance(accountId), transfer({ receiver, yocto, send }) }`.
  * `log`: from `createLog`. With `dryRun`, payments are signed and checked, never sent.
+ * `extraTools`: `[{ definition, run(rawArgs) → { result, logged } }]`, offered to
+ * the model next to `TOOLS`. Only the attack demo (`demo/`) passes any;
+ * `main.mjs` does not, so the production agent has exactly `TOOLS`.
  * Returns `{ answer, payments }`.
  */
-export async function runAgent({ task, cloud, guard, log, model = MODEL, dryRun = false, maxTurns = MAX_TURNS }) {
+export async function runAgent({ task, cloud, guard, log, model = MODEL, dryRun = false, maxTurns = MAX_TURNS, extraTools = [] }) {
   const payments = [];
+  const tools = [...TOOLS, ...extraTools.map((t) => t.definition)];
   let attestation;
   try {
     attestation = summarizeAttestation(await cloud.verify(model));
@@ -131,7 +135,7 @@ export async function runAgent({ task, cloud, guard, log, model = MODEL, dryRun 
   for (let turn = 1; turn <= maxTurns; turn++) {
     let completion;
     try {
-      completion = await cloud.chat({ model, messages, tools: TOOLS, tool_choice: "auto" });
+      completion = await cloud.chat({ model, messages, tools, tool_choice: "auto" });
     } catch (e) {
       log.write({ event: "completion_failed", model, turn, error: errorText(e) });
       log.print(`✗ model call failed: ${errorText(e)}`);
@@ -172,7 +176,7 @@ export async function runAgent({ task, cloud, guard, log, model = MODEL, dryRun 
       return { answer: message.content ?? null, payments };
     }
     for (const call of toolCalls) {
-      const result = await runTool(call, { guard, log, model, dryRun, payments });
+      const result = await runTool(call, { guard, log, model, dryRun, payments, extraTools });
       messages.push({ role: "tool", tool_call_id: call.id, content: JSON.stringify(result) });
     }
   }
@@ -180,10 +184,17 @@ export async function runAgent({ task, cloud, guard, log, model = MODEL, dryRun 
   return { answer: null, payments };
 }
 
-async function runTool(call, { guard, log, model, dryRun, payments }) {
+async function runTool(call, { guard, log, model, dryRun, payments, extraTools }) {
   const name = call.function?.name;
   const rawArgs = call.function?.arguments;
   const entry = { event: "tool_call", model, tool: name, arguments: rawArgs };
+
+  const extra = extraTools.find((t) => t.definition.function.name === name);
+  if (extra) {
+    const { result, logged } = await extra.run(rawArgs);
+    log.write({ ...entry, ...logged, result });
+    return result;
+  }
 
   if (name === "get_balance") {
     try {
