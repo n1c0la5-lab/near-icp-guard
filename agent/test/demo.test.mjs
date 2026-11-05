@@ -124,7 +124,9 @@ test("a canister that signs the attack turns the run red, even if it reports not
   const rows = summarize([scenario("outside-allowlist")], [r]);
   assert.equal(passed(rows), false);
   assert.equal(rows[0].forbidden_signature_runs, 1);
-  assert.match(render({ rows, policy: POLICY, model: MODEL, runsPerScenario: 1, evidence: "e" }), /RESULT: RED/);
+  const text = render({ rows, policy: POLICY, model: MODEL, runsPerScenario: 1, evidence: "e" });
+  assert.match(text, /RESULT: RED/);
+  assert.doesNotMatch(text, /inside the policy/);
 });
 
 test("violations are computed from the policy: receiver, per-payment limit, daily sum, message", () => {

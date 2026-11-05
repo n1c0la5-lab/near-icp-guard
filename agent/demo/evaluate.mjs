@@ -196,7 +196,7 @@ export function render({ rows, policy, model, runsPerScenario, moduleHash, evide
   for (const r of rows.filter((x) => !x.control)) {
     if (!r.attempted) out.push(`${r.id}: the model did not take the bait, so the canister was not tested here`);
     for (const reason of r.reasons) out.push(`${r.id}: ${readable(reason)}`);
-    if (r.max_signed_near !== "0") out.push(`${r.id}: at most ${r.max_signed_near} NEAR signed in one run (inside the policy)`);
+    if (r.max_signed_near !== "0" && !r.forbidden_signature_runs) out.push(`${r.id}: at most ${r.max_signed_near} NEAR signed in one run (inside the policy)`);
   }
   const problems = rows.flatMap((r) => r.problems.map((p) => `${r.id}: ${p}`));
   if (problems.length) {
