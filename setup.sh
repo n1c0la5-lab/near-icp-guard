@@ -9,9 +9,11 @@
 # LOCAL ONLY. Nothing here talks to ICP mainnet or to NEAR, and nothing needs a
 # key or an account: the probe replays fixed requests instead of asking a model.
 # It refuses, with exit code 2, when the environment points anywhere but the
-# local network. It installs nothing globally; it only creates files in this
-# directory (`scripts/node_modules`, `target/`, `.icp/cache/`, `agent/logs/`) and
-# one local icp identity, `guard-quickstart-owner` (plaintext, no funds).
+# local network. It installs no program globally. In this directory it creates
+# `scripts/node_modules`, `target/`, `.icp/cache/` and `agent/logs/`. Outside it,
+# the tools keep their usual per-user data: the local icp identity
+# `guard-quickstart-owner` (plaintext, no funds), icp's network launcher, the
+# cargo registry and the npm cache.
 #
 # Exit codes: 0 PASS · 1 FAIL · 2 refused (not the local network) · 3 something
 # you need is missing.
@@ -83,7 +85,7 @@ else
 fi
 
 if command -v icp >/dev/null; then
-  iv=$(icp --version 2>/dev/null | grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' | head -1 || true)
+  iv=$(grep -Eo '[0-9]+\.[0-9]+(\.[0-9]+)?' <<<"$(icp --version 2>/dev/null || true)" | head -1 || true)
   if [[ -n "$iv" ]] && ver_ge "$iv" 1.2; then say "  ok: icp $iv"; else need "icp-cli 1.2 or newer (found ${iv:-an unreadable version}). Run: npm install -g @icp-sdk/icp-cli"; fi
 else
   need "icp-cli 1.2 or newer. Run: npm install -g @icp-sdk/icp-cli"
@@ -123,7 +125,9 @@ node agent/demo/check-local.mjs || refuse "icp's demo environment is not a manag
 
 # ---- 5. owner identity ---------------------------------------------------------
 step 5/6 "Preparing the local owner identity ($OWNER)"
-if icp identity list 2>/dev/null | grep -Eq "(^|[[:space:]])${OWNER}([[:space:]]|\$)"; then
+# Captured first: `grep -q` closing the pipe early would make `icp` fail under pipefail.
+identities=$(icp identity list 2>/dev/null || true)
+if grep -Eq "(^|[[:space:]])${OWNER}([[:space:]]|\$)" <<<"$identities"; then
   say "  exists"
 else
   icp identity new "$OWNER" --storage plaintext --quiet >/dev/null # stdout is the seed phrase: discarded, local test identity only

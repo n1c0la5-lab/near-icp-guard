@@ -23,16 +23,20 @@ cd near-icp-guard
 You need Node 22+, Rust with the `wasm32-unknown-unknown` target, `icp` ≥ 1.2
 (`npm install -g @icp-sdk/icp-cli`) and `ic-wasm` (`cargo install ic-wasm --locked`).
 The script checks all of them first and, if something is missing, says what to
-install and changes nothing. It installs nothing globally. No key, no NEAR AI
+install and changes nothing. It installs no program globally. No key, no NEAR AI
 account, no testnet account, no mainnet.
 
 What it does: starts a **local** ICP network (PocketIC, port 8010 from
 `icp.yaml`), builds and installs the guard canister on it, sets a policy
 (0.2 NEAR per payment, 0.5 NEAR per day, one allowed receiver, one NEP-413
-recipient), and replays seven fixed requests through the real agent loop: two
-the policy allows and five it must refuse (receiver outside the allowlist, a
-plausible look-alike receiver, over the per-payment limit, splitting against the
-daily limit, a NEP-413 signature for `intents.near`). It ends with **`PASS`**
+recipient), and replays seven scenarios (11 fixed requests) through the real
+agent loop: 4 requests the policy allows are signed and 7 it must refuse are
+refused. The scenarios are two controls (a real invoice, a login message), a
+receiver outside the allowlist, a plausible look-alike receiver, an amount over
+the per-payment limit, a NEP-413 signature for `intents.near`, and splitting
+against the daily limit. The splitting scenario sends five payments of 0.2 NEAR
+to the allowed receiver: the first two are signed, the last three refused
+because the daily limit would be exceeded. It ends with **`PASS`**
 (exit code 0) or **`FAIL`** (1). Exit code 2 means it refused to run (see below),
 3 that something you need is missing. Run it again any time; a second run
 reuses the network and reinstalls the canister.
@@ -59,10 +63,13 @@ What it does **not** show:
   here, only the rules in front of it.
 - **Not mainnet.** The canister is not deployed to ICP mainnet.
 
-It leaves the network running; stop it with `icp network stop`. It creates files
-only in this directory (`scripts/node_modules`, `target/`, `.icp/cache/`,
-`agent/logs/quickstart/<time>/` with the evidence) and one local icp identity,
-`guard-quickstart-owner` (plaintext, holds nothing). If port 8010 is taken, it
+It leaves the network running; stop it with `icp network stop`. In this
+directory it creates `scripts/node_modules`, `target/`, `.icp/cache/` and
+`agent/logs/quickstart/<time>/` (the evidence). Outside it, the tools keep their
+usual per-user data: the local icp identity `guard-quickstart-owner` (plaintext,
+holds nothing) in icp's data directory, icp's downloaded network launcher
+(`~/.local/share/icp-cli` on Linux), the cargo registry and crates (`~/.cargo`)
+and the npm cache. Nothing is installed globally and nothing needs root. If port 8010 is taken, it
 says so; change `gateway.port` in `icp.yaml`.
 
 **Local only, enforced.** Before it touches a canister it requires
