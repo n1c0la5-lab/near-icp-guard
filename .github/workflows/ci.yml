@@ -54,3 +54,49 @@ jobs:
       - name: Agent tests (no network; cloud, icp and NEAR RPC are stand-ins)
         working-directory: agent
         run: npm test
+
+  # The README's one command, as a stranger runs it: no keys, no model, local
+  # network only. The sabotage steps show that PASS looks at something.
+  quickstart:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Rust 1.99.0 with wasm32
+        run: |
+          rustup toolchain install 1.99.0 --profile minimal --target wasm32-unknown-unknown
+          rustup default 1.99.0
+      - name: icp-cli and ic-wasm (as the README lists them)
+        run: |
+          npm install -g @icp-sdk/icp-cli@1.8.0
+          cargo install ic-wasm --locked --version 0.11.1
+      - name: ./setup.sh
+        run: ./setup.sh
+      - name: ./setup.sh again (second run reuses the network)
+        run: ./setup.sh
+      - name: The lock refuses a non-local environment (exit code 2, before anything runs)
+        run: |
+          for v in ICP_ENVIRONMENT ICP_ENV ICP_NETWORK; do
+            rc=0
+            env "$v=ic" ./setup.sh > refuse.out 2>&1 || rc=$?
+            cat refuse.out
+            [ "$rc" = 2 ] || exit 1
+            grep -q "^REFUSED: $v=ic" refuse.out
+          done
+      - name: A canister that signs a forbidden payment makes setup.sh FAIL (exit code 1)
+        run: |
+          git clone . ../guard-sabotage
+          (cd ../guard-sabotage
+           perl -0pi -e 's/        if !self\.rules\.allows\(receiver_id\) \{\n            return Err\(Refusal::ReceiverNotAllowed\(receiver_id\.to_string\(\)\)\);\n        \}\n//' canister/src/policy.rs
+           git diff --stat | tail -1 | grep -q '3 deletions'
+           cargo build --locked --target wasm32-unknown-unknown --release -p guard
+           ic-wasm target/wasm32-unknown-unknown/release/guard.wasm -o /tmp/sabotaged.wasm \
+             metadata candid:service -f canister/guard.did -v public)
+          rc=0
+          ./setup.sh --wasm /tmp/sabotaged.wasm > sabotage.out 2>&1 || rc=$?
+          tail -25 sabotage.out
+          [ "$rc" = 1 ] || exit 1
+          grep -q "^FAIL" sabotage.out
