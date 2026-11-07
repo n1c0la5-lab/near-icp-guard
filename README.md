@@ -720,7 +720,8 @@ None of this needs cycles, a key or anyone's password.
    The answer has `final_execution_status` `FINAL`, `status` `SuccessValue`
    and one `Transfer` action of `10000000000000000000000` yoctoNEAR.
 3. **The canister id** is in the repository (`.icp/data/mappings/ic.ids.json`),
-   so `icp canister status guard -n ic --public` works from a clone too.
+   so `icp canister status guard -e ic --public` works from a clone too (with a
+   canister name, icp wants `-e ic`, not `-n ic`).
 
 Reading the policy or the audit log, and every signature, need the owner's or
 the agent's identity and are not open to others.
