@@ -768,9 +768,9 @@ the agent's identity and are not open to others.
   account.
 - **Upgrades.** Exercised on the local network only (`scripts/e2e-policy.sh`);
   none has been run on the mainnet canister.
-- **Policy with real NEAR.** One policy-checked transfer has reached NEAR
-  testnet (above); everything else ran on the local network with fake block
-  hashes. Not on NEAR mainnet.
+- **Policy with real NEAR.** One policy-checked transfer from the local
+  canister and one from the mainnet canister have reached NEAR testnet (above);
+  everything else ran with fake block hashes. Not on NEAR mainnet.
 - **The policy limits NEAR, not the number of signatures.** Amounts are
   capped per payment and per day, but nothing caps how often the agent asks.
   A fooled agent can repeat payments of a tiny amount to an allowed receiver
