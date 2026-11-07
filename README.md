@@ -667,7 +667,10 @@ earlier on the environment variables listed in the [Quickstart](#quickstart).
 ## On ICP mainnet
 
 The guard canister is deployed as
-`ch3s7-hiaaa-aaaao-qqm3q-cai`. It runs on a normal (not fiduciary) subnet. The threshold key is `key_1`,
+`ch3s7-hiaaa-aaaao-qqm3q-cai`. It runs on a normal (not fiduciary) subnet: measured through the
+public IC API (`ic-api.internetcomputer.org/api/v3/canisters/<id>`), an
+application subnet with 13 nodes,
+`fuqsr-in2lc-zbcjj-ydmcw-pzq7h-4xm2z-pto4i-dcyee-5z4rz-x63ji-nae`. The threshold key is `key_1`,
 set by an install argument (`(opt record { key_name = opt "key_1" })`); without
 it the canister would use `test_key_1`. The module hash is
 `0xf3d8a6865329560e23a5a92fe29e9869d689c3fb8faffe07d7da2558848d4eea`, built
@@ -683,8 +686,9 @@ What was measured on this canister (7 November 2026):
   [`HVSorG3F2y85HcBxC5Sun7LTWDUPmRYJE3Am9ooKfBhj`](https://testnet.nearblocks.io/txns/HVSorG3F2y85HcBxC5Sun7LTWDUPmRYJE3Am9ooKfBhj)
   (status `FINAL`, checked through NEAR RPC). A script sent it; the model
   agent was not involved.
-- **`key_1` is the key that signed.** The cycles the signature cost came to
-  26,218,941,691. The documented fee for `key_1` is 26,153,846,153 cycles per
+- **`key_1` is the key that signed.** Across the signature the canister's balance
+  fell by 26,218,941,691 cycles, which is the fee plus about 65 million for
+  the surrounding calls. The documented fee for `key_1` is 26,153,846,153 cycles per
   signature (about $0.036); for `test_key_1` it is 10 billion.
 - **Latency.** `icp canister call` from one place, one call after another,
   including the CLI start and ingress: a request the policy refuses took a
