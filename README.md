@@ -12,6 +12,12 @@ an audit log.
 
 Built at NEAR HACKATHON (Nov 2026).
 
+**Status:** the canister runs on ICP mainnet as `ch3s7-hiaaa-aaaao-qqm3q-cai`
+with the production threshold key `key_1`, and has signed a payment that NEAR
+testnet accepted. What ran there and what did not is under
+[On ICP mainnet](#on-icp-mainnet). The [quickstart](#quickstart) below runs
+only on a local network.
+
 ## Quickstart
 
 ```bash
@@ -24,7 +30,7 @@ You need Node 22+, Rust with the `wasm32-unknown-unknown` target, `icp` ≥ 1.2
 (`npm install -g @icp-sdk/icp-cli`) and `ic-wasm` (`cargo install ic-wasm --locked`).
 The script checks all of them first and, if something is missing, says what to
 install and changes nothing. It installs no program globally. No key, no NEAR AI
-account, no testnet account, no mainnet.
+account, no testnet account, and it never touches mainnet.
 
 What it does: starts a **local** ICP network (PocketIC, port 8010 from
 `icp.yaml`), builds and installs the guard canister on it, sets a policy
@@ -57,11 +63,14 @@ What it does **not** show:
   [attack demo](#attack-demo) with a NEAR AI Cloud key, which is optional.
 - **Nothing is sent to NEAR.** The signed transactions use a zero block hash and
   could not be accepted by any NEAR network. The transactions that really
-  reached NEAR testnet are listed in [Proven so far](#proven-so-far-spike-gate).
+  reached NEAR testnet are listed in [Proven so far](#proven-so-far-local-network-near-testnet) and [On ICP mainnet](#on-icp-mainnet).
 - **No distributed key.** The local network runs on one machine with a local
   test key, so the property that the key never exists in one place is not shown
-  here, only the rules in front of it.
-- **Not mainnet.** The canister is not deployed to ICP mainnet.
+  here, only the rules in front of it. The deployed canister uses `key_1` (see
+  [On ICP mainnet](#on-icp-mainnet)).
+- **Not mainnet.** The quickstart runs only on a local network and refuses
+  anything else (see "Local only, enforced" below). The project is deployed to
+  ICP mainnet separately; the quickstart does not touch that canister.
 
 It leaves the network running; stop it with `icp network stop`. In this
 directory it creates `scripts/node_modules`, `target/`, `.icp/cache/` and
@@ -655,7 +664,68 @@ earlier on the environment variables listed in the [Quickstart](#quickstart).
   vectors and `verifyMessage`; `ic-cdk` and `ed25519-dalek` in the canister.
 - The code in this repository was written with **Claude Code**.
 
-## Proven so far (spike gate)
+## On ICP mainnet
+
+The guard canister is deployed as
+`ch3s7-hiaaa-aaaao-qqm3q-cai`. It runs on a normal (not fiduciary) subnet. The threshold key is `key_1`,
+set by an install argument (`(opt record { key_name = opt "key_1" })`); without
+it the canister would use `test_key_1`. The module hash is
+`0xf3d8a6865329560e23a5a92fe29e9869d689c3fb8faffe07d7da2558848d4eea`, built
+from `main` at commit `1f2ccd2`. The canister has two controllers, an owner
+and a backup, and a freezing threshold of 90 days, set by the owner.
+
+What was measured on this canister (7 November 2026):
+
+- **A payment accepted by NEAR testnet.** The canister's own NEAR testnet
+  account is
+  `5e027c012faa93f71ab585a1dd2bcb8c0c5de05c145cb92c60a4d75f26d91dfd`. It
+  signed a transfer of 0.01 NEAR, and NEAR testnet finalized it:
+  [`HVSorG3F2y85HcBxC5Sun7LTWDUPmRYJE3Am9ooKfBhj`](https://testnet.nearblocks.io/txns/HVSorG3F2y85HcBxC5Sun7LTWDUPmRYJE3Am9ooKfBhj)
+  (status `FINAL`, checked through NEAR RPC). A script sent it; the model
+  agent was not involved.
+- **`key_1` is the key that signed.** The cycles the signature cost came to
+  26,218,941,691. The documented fee for `key_1` is 26,153,846,153 cycles per
+  signature (about $0.036); for `test_key_1` it is 10 billion.
+- **Latency.** `icp canister call` from one place, one call after another,
+  including the CLI start and ingress: a request the policy refuses took a
+  median of 1.28 s (n=5); a request that was signed took a median of 5.43 s
+  (n=10, range 5.01 to 7.85 s). This is not a load test.
+
+What did **not** run on this canister: the agent, the attack demo and any
+model. The measurements in [Agent](#agent) and [Attack demo](#attack-demo)
+come from the local network with `test_key_1`.
+
+### Check it yourself
+
+None of this needs cycles, a key or anyone's password.
+
+1. **Controllers and module hash**, public:
+   `icp canister status ch3s7-hiaaa-aaaao-qqm3q-cai -n ic --public`
+   lists the two controllers and the module hash; compare the hash with the one
+   above. The freezing threshold is not part of this public report. The
+   policy binds callers, not controllers (see
+   [NEP-413 messages](#nep-413-messages)): whoever controls the canister can
+   install other code, so the controller list is part of what you trust.
+2. **The payment.** Open the nearblocks link above: signer
+   `5e027c01…1dfd`, one `Transfer` action of 0.01 NEAR, `FINAL`. Through RPC:
+
+   ```bash
+   curl -s -X POST https://rpc.testnet.near.org -H 'content-type: application/json' -d '{
+     "jsonrpc":"2.0","id":1,"method":"tx","params":{
+       "tx_hash":"HVSorG3F2y85HcBxC5Sun7LTWDUPmRYJE3Am9ooKfBhj",
+       "sender_account_id":"5e027c012faa93f71ab585a1dd2bcb8c0c5de05c145cb92c60a4d75f26d91dfd",
+       "wait_until":"FINAL"}}'
+   ```
+
+   The answer has `final_execution_status` `FINAL`, `status` `SuccessValue`
+   and one `Transfer` action of `10000000000000000000000` yoctoNEAR.
+3. **The canister id** is in the repository (`.icp/data/mappings/ic.ids.json`),
+   so `icp canister status guard -n ic --public` works from a clone too.
+
+Reading the policy or the audit log, and every signature, need the owner's or
+the agent's identity and are not open to others.
+
+## Proven so far (local network, NEAR testnet)
 
 - **Signed on ICP, accepted by NEAR testnet.** The canister signed a 0.1 NEAR
   transfer with its threshold key; NEAR finalized it:
@@ -664,7 +734,8 @@ earlier on the environment variables listed in the [Quickstart](#quickstart).
   `10283143de96cb3c61b3e410ba13589bd7cd7fbdcdd718860673e2833cb22c86`, key
   `ed25519:265531gAWxPEFvGhDbiNhudp2X7CPmTZgvHAMScGqPbj`, action
   `Transfer` of 0.1 NEAR. This ran against a local ICP network with the local
-  `test_key_1`, not against mainnet ICP.
+  `test_key_1`, not against ICP mainnet. The same step on mainnet with `key_1`
+  is under [On ICP mainnet](#on-icp-mainnet).
 - `icp.yaml` builds and deploys locally (with the two fixes above).
 - `test_key_1` exists on the local network; `account` returns the same NEAR
   account before and after a reinstall.
@@ -689,13 +760,28 @@ earlier on the environment variables listed in the [Quickstart](#quickstart).
 
 ## Known unknowns (check before trusting)
 
-- **Key name.** Default `test_key_1`. Production is `key_1`, not yet tried.
-  Override at install with `(opt record { key_name = opt "key_1" })`.
-- **Upgrades.** Exercised on the local network only (`scripts/e2e-policy.sh`),
-  not on ICP mainnet.
+- **Key name.** Default `test_key_1`; the mainnet canister was installed with
+  `key_1` (`(opt record { key_name = opt "key_1" })`), and one signature there
+  confirmed it by its cost. There is no query for the key name, and a canister
+  installed without the argument has a different key and so a different NEAR
+  account.
+- **Upgrades.** Exercised on the local network only (`scripts/e2e-policy.sh`);
+  none has been run on the mainnet canister.
 - **Policy with real NEAR.** One policy-checked transfer has reached NEAR
   testnet (above); everything else ran on the local network with fake block
   hashes. Not on NEAR mainnet.
+- **The policy limits NEAR, not the number of signatures.** Amounts are
+  capped per payment and per day, but nothing caps how often the agent asks.
+  A fooled agent can repeat payments of a tiny amount to an allowed receiver
+  (a tiny amount hardly uses up the daily limit) and NEP-413 messages to an
+  allowed recipient (they count against no limit), and every signature costs
+  the canister cycles (about $0.036 each with `key_1`, per the documentation).
+  Repeated long enough, that uses up the cycles; the canister then stops
+  signing and freezes until someone tops it up. The damage to NEAR stays inside
+  the policy, but availability does not: the owner's protection is the size of
+  the cycle balance and the freezing threshold, not a rule. Read from
+  `canister/src/policy.rs` and `lib.rs`, where no rule counts or rate-limits
+  requests; not tested by exhausting cycles.
 - **Audit log flooding by the agent.** Strangers are only counted, but the
   agent itself (for example a compromised one) can still fill the ring buffer
   with rejected requests and push older entries out; `seq` shows that it
@@ -720,7 +806,10 @@ earlier on the environment variables listed in the [Quickstart](#quickstart).
   signature. It does **not** check *which* deployment runs (no image-provenance
   or deployment policy is configured): the log says `deployment_provenance:
   "not verified"`. End-to-end encryption of the chat (`e2ee`) is off.
-- **ICP mainnet.** Nothing here has run on ICP mainnet.
+- **ICP mainnet.** Run there: installation with `key_1`, signed transfers
+  (one to NEAR testnet), refused requests, the latency above. Not run there:
+  the agent, the attack demo, NEP-413 messages, an upgrade, any load. The
+  latency is one location and a small sample.
 
 ## License
 
