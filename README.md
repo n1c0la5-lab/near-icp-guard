@@ -12,6 +12,73 @@ an audit log.
 
 Built at NEAR HACKATHON (Nov 2026).
 
+## Quickstart
+
+```bash
+git clone https://github.com/n1c0la5-lab/near-icp-guard
+cd near-icp-guard
+./setup.sh
+```
+
+You need Node 22+, Rust with the `wasm32-unknown-unknown` target, `icp` ≥ 1.2
+(`npm install -g @icp-sdk/icp-cli`) and `ic-wasm` (`cargo install ic-wasm --locked`).
+The script checks all of them first and, if something is missing, says what to
+install and changes nothing. It installs no program globally. No key, no NEAR AI
+account, no testnet account, no mainnet.
+
+What it does: starts a **local** ICP network (PocketIC, port 8010 from
+`icp.yaml`), builds and installs the guard canister on it, sets a policy
+(0.2 NEAR per payment, 0.5 NEAR per day, one allowed receiver, one NEP-413
+recipient), and replays seven scenarios (11 fixed requests) through the real
+agent loop: 4 requests the policy allows are signed and 7 it must refuse are
+refused. The scenarios are two controls (a real invoice, a login message), a
+receiver outside the allowlist, a plausible look-alike receiver, an amount over
+the per-payment limit, a NEP-413 signature for `intents.near`, and splitting
+against the daily limit. The splitting scenario sends five payments of 0.2 NEAR
+to the allowed receiver: the first two are signed, the last three refused
+because the daily limit would be exceeded. It ends with **`PASS`**
+(exit code 0) or **`FAIL`** (1). Exit code 2 means it refused to run (see below),
+3 that something you need is missing. Run it again any time; a second run
+reuses the network and reinstalls the canister.
+Measured on a 16-core machine with empty cargo, npm and icp caches (the
+downloads included): 64 seconds; a rerun takes 30 to 42 seconds. Slower
+machines take longer, mostly for the wasm build.
+
+What PASS means: the verdict comes from the canister's own `audit_log`, not
+from the script's output. Every allowed request was signed, every forbidden one
+was refused for the expected reason, and no signature exists that the policy
+forbids. If the canister's rules are broken, it turns `FAIL` (see
+[Sabotage probes](#sabotage-probes)).
+
+What it does **not** show:
+
+- **No model.** The requests are fixed, so it shows what the *canister* does
+  with them, not that a model can be tricked. That is the
+  [attack demo](#attack-demo) with a NEAR AI Cloud key, which is optional.
+- **Nothing is sent to NEAR.** The signed transactions use a zero block hash and
+  could not be accepted by any NEAR network. The transactions that really
+  reached NEAR testnet are listed in [Proven so far](#proven-so-far-spike-gate).
+- **No distributed key.** The local network runs on one machine with a local
+  test key, so the property that the key never exists in one place is not shown
+  here, only the rules in front of it.
+- **Not mainnet.** The canister is not deployed to ICP mainnet.
+
+It leaves the network running; stop it with `icp network stop`. In this
+directory it creates `scripts/node_modules`, `target/`, `.icp/cache/` and
+`agent/logs/quickstart/<time>/` (the evidence). Outside it, the tools keep their
+usual per-user data: the local icp identity `guard-quickstart-owner` (plaintext,
+holds nothing) in icp's data directory, icp's downloaded network launcher
+(`~/.local/share/icp-cli` on Linux), the cargo registry and crates (`~/.cargo`)
+and the npm cache. Nothing is installed globally and nothing needs root. If port 8010 is taken, it
+says so; change `gateway.port` in `icp.yaml`.
+
+**Local only, enforced.** Before it touches a canister it requires
+`icp network status -e demo --json` to report a *managed* network on *this
+machine*; it refuses (exit code 2) if `ICP_ENVIRONMENT`, `ICP_ENV` or
+`ICP_NETWORK` name anything but `local` or `demo`, if `ICP_PROJECT_ROOT` points
+elsewhere, or if `icp.yaml` points the `demo` environment at `ic`. The
+[probes](#local-only) show each of these.
+
 ## How it works
 
 1. The canister derives an Ed25519 public key via `schnorr_public_key`.
@@ -423,14 +490,17 @@ the model sees in these runs is a stand-in value too.
 ### Do this
 
 Without a model or an API key, replaying the attack requests against the real
-canister (under a minute):
+canister is what [`./setup.sh`](#quickstart) does, with checks around it. Done
+by hand, it is:
 
 ```bash
 icp network start -d
 (cd scripts && npm ci --ignore-scripts)
-(cd agent && npm ci --ignore-scripts)
-node agent/demo/demo.mjs --scripted --runs 1
+node agent/demo/demo.mjs --scripted --runs 1   # needs a non-anonymous default icp identity
 ```
+
+For the model, install the agent's dependencies too (Node 24.22.1+):
+`(cd agent && npm ci --ignore-scripts)`.
 
 With the model on NEAR AI Cloud (about 30 seconds per run, API key as in
 [Agent](#agent)):
@@ -527,18 +597,25 @@ different module hash, and each ends with `RESULT: RED` and exit code 1:
 With the model and the allowlist check removed (3 runs per scenario, plausible
 receiver), the signature appears the same way and the result is red.
 
-To repeat one, change `canister/src/policy.rs` in a scratch copy, then in it:
+To repeat one, work in a scratch clone and leave this one alone. Example: the
+allowlist check removed (the `perl` line deletes exactly three lines; `git diff
+--stat` must say `3 deletions`):
 
 ```bash
+git clone . /tmp/guard-sabotage
+cd /tmp/guard-sabotage
+perl -0pi -e 's/        if !self\.rules\.allows\(receiver_id\) \{\n            return Err\(Refusal::ReceiverNotAllowed\(receiver_id\.to_string\(\)\)\);\n        \}\n//' canister/src/policy.rs
+git diff --stat
 cargo build --locked --target wasm32-unknown-unknown --release -p guard
 ic-wasm target/wasm32-unknown-unknown/release/guard.wasm -o /tmp/sabotaged.wasm \
   metadata candid:service -f canister/guard.did -v public
+cd -
 ```
 
-and from this repository:
+and in this clone, with the network from `./setup.sh` running:
 
 ```bash
-node agent/demo/demo.mjs --scripted --runs 1 --wasm /tmp/sabotaged.wasm
+./setup.sh --wasm /tmp/sabotaged.wasm    # ends with FAIL and exit code 1
 ```
 
 ### Without a network
@@ -562,6 +639,9 @@ before cycles move, it requires `icp network status -e demo --json` to report a
 managed network on this machine. Measured: with `network: ic` in `icp.yaml` it
 stops with `refusing: https://icp-api.io/ is not a local managed network` and
 exit code 2.
+
+`./setup.sh` makes the same check before it installs anything, and stops
+earlier on the environment variables listed in the [Quickstart](#quickstart).
 
 ## Built with
 

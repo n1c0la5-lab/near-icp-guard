@@ -12,6 +12,7 @@ import { attempted, evaluateRun, parseAuditLog, passed, render, summarize, viola
 import { assertLocalNetwork, CYCLES_FLOOR, parseCycles } from "../demo/local.mjs";
 import { scriptedCloud } from "../demo/scripted.mjs";
 import { demoTools, offlineRpc, OFFLINE_BLOCK_HASH, signMessage } from "../demo/tools.mjs";
+import { verdict } from "../demo/verdict.mjs";
 
 const FILE = JSON.parse(readFileSync(new URL("../demo/scenarios.json", import.meta.url), "utf8"));
 const POLICY = FILE.policy;
@@ -308,4 +309,43 @@ test("the extra tools reach the model only when passed: the default stays exactl
   const events = [];
   await runAgent({ task: "t", cloud: scriptedCloud(scenario("control-payment")), guard: {}, log: { write: (e) => events.push(e), print() {} }, maxTurns: 1 });
   assert.equal(events.find((e) => e.event === "tool_call")?.error, "unknown tool");
+});
+
+// ---- the verdict of ./setup.sh ------------------------------------------------
+
+const GOOD_ROWS = [
+  { id: "control-payment", control: true, runs: 1, signed_runs: 1, attempted: 1, refused_of_attempted: 0, forbidden_signature_runs: 0, problems: [] },
+  { id: "outside-allowlist", control: false, runs: 1, signed_runs: 0, attempted: 1, refused_of_attempted: 1, forbidden_signature_runs: 0, problems: [] },
+];
+const GOOD_RESULTS = [{ scenario: "control-payment", signed: 1, refused: 0, violations: [] }, { scenario: "outside-allowlist", signed: 0, refused: 1, violations: [] }];
+const summary = (over = {}) => ({ rows: GOOD_ROWS, results: GOOD_RESULTS, module_hash: "0xabc", aborted: null, stopped_by_budget: false, ...over });
+const withRow = (i, over) => GOOD_ROWS.map((r, j) => (j === i ? { ...r, ...over } : r));
+
+test("verdict: a summary where controls were signed and attacks refused passes", () => {
+  const v = verdict(summary());
+  assert.equal(v.ok, true, v.problems.join("; "));
+  assert.match(v.lines[0], /requests signed:\s+1$/);
+  assert.match(v.lines[1], /requests refused:\s+1$/);
+  assert.match(v.lines[2], /forbidden requests signed: 0$/);
+  const bad = verdict(summary({ results: [{ ...GOOD_RESULTS[1], signed: 1, refused: 0, violations: ["x"] }] }));
+  assert.match(bad.lines[2], /forbidden requests signed: 1$/);
+});
+
+test("verdict: an empty or unreadable summary is a FAIL, not a pass", () => {
+  assert.equal(verdict(summary({ rows: [] })).ok, false);
+  assert.equal(verdict({}).ok, false);
+  assert.equal(verdict(null).ok, false);
+});
+
+test("verdict: each way a PASS could be empty is a FAIL", () => {
+  assert.equal(verdict(summary({ rows: withRow(1, { forbidden_signature_runs: 1 }) })).ok, false, "forbidden signature");
+  assert.equal(verdict(summary({ rows: withRow(0, { signed_runs: 0 }) })).ok, false, "control not signed");
+  assert.equal(verdict(summary({ rows: withRow(1, { attempted: 0, refused_of_attempted: 0 }) })).ok, false, "attack never reached the canister");
+  assert.equal(verdict(summary({ rows: withRow(1, { refused_of_attempted: 0 }) })).ok, false, "attack not refused");
+  assert.equal(verdict(summary({ rows: withRow(1, { problems: ["x"] }) })).ok, false, "demo problem");
+  assert.equal(verdict(summary({ rows: [GOOD_ROWS[1]] })).ok, false, "no control");
+  assert.equal(verdict(summary({ rows: [GOOD_ROWS[0]] })).ok, false, "no attack");
+  assert.equal(verdict(summary({ aborted: "boom" })).ok, false, "aborted");
+  assert.equal(verdict(summary({ stopped_by_budget: true })).ok, false, "stopped");
+  assert.equal(verdict(summary({ module_hash: undefined })).ok, false, "no module hash");
 });
