@@ -90,6 +90,36 @@ elsewhere, or if `icp.yaml` points the `demo` environment at `ic`. The
 
 ## How it works
 
+```mermaid
+sequenceDiagram
+    autonumber
+    actor Owner
+    participant Agent as AI agent<br/>(NEAR AI Cloud)
+    participant Guard as guard canister<br/>(ICP)
+    participant Subnet as ICP subnet<br/>(threshold Ed25519)
+    participant NEAR as NEAR RPC
+
+    Owner->>Guard: set_agent, set_policy (limits, allowlists)
+    Agent->>NEAR: nonce + block hash
+    Agent->>Guard: sign_transfer(receiver, amount)
+    Guard->>Guard: per-tx limit, allowlist, daily limit
+    alt policy refuses
+        Guard-->>Agent: Rejected (reason in audit log)
+    else policy allows
+        Guard->>Guard: reserve amount, build tx (Borsh)
+        Guard->>Subnet: sign_with_schnorr(sha256(tx))
+        Subnet-->>Guard: signature (key never in one place)
+        Guard->>Guard: verify signature, log Signed + tx hash
+        Guard-->>Agent: signed transaction
+        Agent->>Agent: compare with @near-js/transactions, verify signature
+        Agent->>NEAR: send_tx
+    end
+```
+
+The agent never holds a key and cannot change the policy. Off-chain NEP-413
+messages follow the same path through `sign_message` with their own recipient
+rule ([NEP-413 messages](#nep-413-messages)).
+
 1. The canister derives an Ed25519 public key via `schnorr_public_key`.
 2. Its NEAR account is the **implicit account** `hex(public_key)`. Sending
    testnet NEAR to it creates it, with the canister's key as its only
