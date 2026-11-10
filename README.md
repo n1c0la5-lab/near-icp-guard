@@ -1,4 +1,6 @@
-# near-icp-guard (working title)
+# Unheld
+
+*Your agent doesn't hold keys. It asks.*
 
 An ICP canister that owns a NEAR account and signs NEAR transactions with a
 **threshold Ed25519 key**: the key is split across the subnet's nodes and never
@@ -21,8 +23,8 @@ only on a local network.
 ## Quickstart
 
 ```bash
-git clone https://github.com/n1c0la5-lab/near-icp-guard
-cd near-icp-guard
+git clone https://github.com/n1c0la5-lab/unheld
+cd unheld
 ./setup.sh
 ```
 
