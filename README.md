@@ -743,10 +743,12 @@ None of this needs cycles, a key or anyone's password.
    [NEP-413 messages](#nep-413-messages)): whoever controls the canister can
    install other code, so the controller list is part of what you trust.
 2. **The payment.** Open the nearblocks link above: signer
-   `5e027c01…1dfd`, one `Transfer` action of 0.01 NEAR, `FINAL`. Through RPC:
+   `5e027c01…1dfd`, one `Transfer` action of 0.01 NEAR, `FINAL`. Through the archival RPC (the regular
+   `rpc.testnet.near.org` keeps only recent data: on 10 November it no longer
+   returned this transaction and answered with a timeout, `NOT_OBSERVED`):
 
    ```bash
-   curl -s -X POST https://rpc.testnet.near.org -H 'content-type: application/json' -d '{
+   curl -s -X POST https://archival-rpc.testnet.near.org -H 'content-type: application/json' -d '{
      "jsonrpc":"2.0","id":1,"method":"tx","params":{
        "tx_hash":"HVSorG3F2y85HcBxC5Sun7LTWDUPmRYJE3Am9ooKfBhj",
        "sender_account_id":"5e027c012faa93f71ab585a1dd2bcb8c0c5de05c145cb92c60a4d75f26d91dfd",
