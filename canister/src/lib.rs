@@ -26,7 +26,8 @@ use policy::{parse_yocto, AuditEntry, Config, Guard, Policy};
 use std::cell::RefCell;
 
 /// Every key this canister derives lives under this path. Changing it changes
-/// the NEAR account.
+/// the NEAR account. It keeps the project's former name (near-icp-guard) on
+/// purpose: the deployed canister's NEAR account depends on it.
 const DERIVATION_PATH: &[u8] = b"near-icp-guard/agent/0";
 /// `test_key_1` exists on mainnet (cheaper, for testing) and — per the icp-cli
 /// examples — on the local network. Production is `key_1`.
